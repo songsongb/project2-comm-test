@@ -1,0 +1,6 @@
+/build/
+/stm32_hub/build/
+__pycache__/
+*.pyc
+/.venv/
+*.log
