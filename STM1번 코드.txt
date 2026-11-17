@@ -1,0 +1,927 @@
+#include "laser_guard.h"
+
+#include <string.h>
+
+enum {
+    SAMPLE_HZ = 10000,
+    DMA_HALF = 32,               /* Power of two, also divides TIM4's wrap. */
+    DMA_SIZE = 2 * DMA_HALF,
+    CAL_PAIRS = SAMPLE_HZ,
+    SOUND_PAIRS = SAMPLE_HZ / 40, /* 25 ms. 250 * 4095^2 fits in uint32_t. */
+    DEBOUNCE_PAIRS = 3,
+    INITIAL_BEAM_PERCENT = 50,
+    SOUND_RMS_FLOOR = 12, /* [SANGI] lowered from 36 for small sounds */
+    HEARTBEAT_MS = 200,
+    TRIAL_TAIL_MS = 250,
+    EVENT_CAPACITY = 16,
+    TRACE_PRE_MS = 100,
+    TRACE_POST_MS = 100,
+    TRACE_PRE_SLOTS = TRACE_PRE_MS * (SAMPLE_HZ / 1000),
+    TRACE_POST_SLOTS = TRACE_POST_MS * (SAMPLE_HZ / 1000),
+    TRACE_TIMEOUT_MS = 15000,
+    TRACE_INDEX_BITS = 11,
+    TRACE_RING_SIZE = 1 << TRACE_INDEX_BITS,
+    TRACE_SLOT_LIMIT = 128 * TRACE_RING_SIZE,
+    TRACE_ROW_PERIOD_MS = 3,
+    TRACE_MAX_GAP_ROW = 64,
+    LDR_PLOT_SAMPLE_MS = 10,
+    LDR_PLOT_UPDATE_MS = 200,
+    LDR_PLOT_FILTER_DIVISOR = 4,
+    LDR_PLOT_MAX_STEP = 350,
+    LDR_PLOT_SCALE = 256
+};
+
+_Static_assert(TRACE_PRE_SLOTS + 1 + TRACE_POST_SLOTS <= TRACE_RING_SIZE,
+               "The trace must fit in the capture ring");
+_Static_assert(TRACE_TIMEOUT_MS * (SAMPLE_HZ / 1000) < TRACE_SLOT_LIMIT,
+               "The trace timeout must fit in the slot tags");
+
+typedef enum { POLLING, INTERRUPT, DMA } Mode;
+
+typedef enum {
+    TRACE_IDLE,
+    TRACE_PREFILL,
+    TRACE_ARMED,
+    TRACE_POST,
+    TRACE_FROZEN,
+    TRACE_ABORTED
+} TraceState;
+
+typedef struct {
+    uint8_t type;
+    uint16_t value;
+} WindowEvent;
+
+typedef struct {
+    bool open, ended, valid, hit;
+    uint32_t start_ms, end_ms;
+} Trial;
+
+typedef struct {
+    uint32_t pairs, missing, cycles, irqs;
+    uint16_t light, min_light, max_light, rms;
+} SamplingStats;
+
+static volatile uint32_t dma_buffer[DMA_SIZE];
+static volatile Mode mode = DMA;
+static bool adc_available;
+static volatile bool acquisition_fault;
+static volatile bool ready;
+static volatile bool beam_active;
+static bool sound_active;
+static bool high_load;
+static volatile uint8_t threshold_percent = INITIAL_BEAM_PERCENT;
+static volatile uint16_t beam_baseline;
+static volatile uint16_t beam_threshold;
+static volatile uint16_t restore_threshold;
+static uint16_t sound_threshold = SOUND_RMS_FLOOR;
+static uint8_t beam_run;
+static uint16_t last_slot;
+static uint16_t poll_slot;
+static volatile uint32_t calibration_left;
+static uint32_t calibration_light;
+static uint32_t calibration_noise;
+static uint16_t calibration_windows;
+static uint32_t sound_sum;
+static uint64_t sound_squares;
+static int32_t sound_lp;       /* [SANGI] low-pass state (Q4) for the high-pass filter */
+static bool sound_lp_valid;
+static uint16_t sound_count;
+static volatile SamplingStats sampling = { .min_light = 4095 };
+/* A single 16-bit SWV write per 200 ms display interval. */
+volatile uint16_t ldr_plot_5hz;
+static bool ldr_plot_log;
+static volatile Trial trial;
+static WindowEvent events[EVENT_CAPACITY];
+static volatile uint8_t event_write;
+static volatile uint8_t event_read;
+static volatile uint32_t lost_events;
+
+/* One word per nominal slot. The top byte tags the ring generation and uses
+   bit 7 as a validity marker. Low 24 bits store the two 12-bit ADC values. */
+static volatile uint32_t trace_ring[TRACE_RING_SIZE];
+static volatile TraceState trace_state;
+static uint32_t trace_slot;
+static uint32_t trace_origin;
+static const char *trace_abort_reason;
+static uint32_t trace_started_ms;
+static uint32_t trace_last_row_ms;
+static unsigned trace_mode, trace_load, trace_threshold;
+static unsigned trace_valid, trace_missing;
+static int trace_offset;
+static bool trace_armed_sent, trace_begin_sent;
+
+static bool trace_collecting(TraceState state) {
+    return state == TRACE_PREFILL || state == TRACE_ARMED || state == TRACE_POST;
+}
+
+static uint32_t trace_tag(uint32_t slot) {
+    return 0x80u | (slot >> TRACE_INDEX_BITS);
+}
+
+static void trace_set_aborted(const char *reason) {
+    trace_abort_reason = reason;
+    __DMB();
+    trace_state = TRACE_ABORTED;
+}
+
+static void trace_abort_if_active(const char *reason) {
+    const uint32_t irq_state = __get_PRIMASK();
+    __disable_irq();
+    if (trace_collecting(trace_state)) {
+        trace_set_aborted(reason);
+    }
+    __set_PRIMASK(irq_state);
+}
+
+static void trace_sample(uint16_t light, uint16_t microphone, uint16_t step) {
+    const TraceState state = trace_state;
+    if (!trace_collecting(state)) {
+        return;
+    }
+    trace_slot += step;
+    if (trace_slot >= TRACE_SLOT_LIMIT) {
+        trace_set_aborted("timeout");
+        return;
+    }
+    const uint32_t post_end = trace_origin + TRACE_POST_SLOTS;
+    if (state != TRACE_POST || trace_slot <= post_end) {
+        trace_ring[trace_slot & (TRACE_RING_SIZE - 1u)] =
+            (trace_tag(trace_slot) << 24) | ((uint32_t)microphone << 12) | light;
+    }
+    if (state == TRACE_PREFILL && trace_slot > TRACE_PRE_SLOTS) {
+        trace_state = TRACE_ARMED;
+    } else if (state == TRACE_POST && trace_slot >= post_end) {
+        /* Nothing writes to the ring while the foreground streams it. */
+        __DMB();
+        trace_state = TRACE_FROZEN;
+    }
+}
+
+static void trace_beam_onset(void) {
+    if (trace_state == TRACE_ARMED) {
+        trace_origin = trace_slot;
+        trace_state = TRACE_POST;
+    } else if (trace_state == TRACE_PREFILL) {
+        trace_set_aborted("early_trigger");
+    }
+}
+
+static void trace_start(void) {
+    if (trace_state != TRACE_IDLE) {
+        lg_log("TRACE_ERROR,busy\r\n");
+        return;
+    }
+    /* Clear old tags with interrupts enabled while capture is idle. */
+    for (unsigned i = 0; i < TRACE_RING_SIZE; ++i) {
+        trace_ring[i] = 0;
+    }
+    const uint32_t irq_state = __get_PRIMASK();
+    __disable_irq();
+    const bool sensor_ready = ready && !acquisition_fault;
+    const bool blocked = beam_active;
+    if (sensor_ready && !blocked) {
+        trace_slot = 0;
+        trace_origin = 0;
+        trace_started_ms = lg_millis();
+        trace_last_row_ms = trace_started_ms;
+        trace_mode = (unsigned)mode;
+        trace_load = high_load ? 1u : 0u;
+        trace_threshold = beam_threshold;
+        trace_valid = 0;
+        trace_missing = 0;
+        trace_offset = -TRACE_PRE_SLOTS;
+        trace_armed_sent = false;
+        trace_begin_sent = false;
+        __DMB();
+        trace_state = TRACE_PREFILL;
+    }
+    __set_PRIMASK(irq_state);
+    if (!sensor_ready) {
+        lg_log("TRACE_ERROR,not_ready\r\n");
+    } else if (blocked) {
+        lg_log("TRACE_ERROR,blocked\r\n");
+    } else {
+        lg_log("TRACE_WAIT,%u\r\n", (unsigned)TRACE_PRE_MS);
+    }
+}
+
+static bool trace_read(int offset, uint32_t *word) {
+    const uint32_t slot = (uint32_t)((int32_t)trace_origin + offset);
+    *word = trace_ring[slot & (TRACE_RING_SIZE - 1u)];
+    return (*word >> 24) == trace_tag(slot);
+}
+
+static void trace_service(uint32_t now) {
+    const TraceState state = trace_state;
+    if (trace_collecting(state)) {
+        if (acquisition_fault) {
+            trace_abort_if_active("acquisition_fault");
+        } else if ((uint32_t)(now - trace_started_ms) >= TRACE_TIMEOUT_MS) {
+            trace_abort_if_active("timeout");
+        } else if (state == TRACE_ARMED && !trace_armed_sent) {
+            trace_armed_sent = lg_log("TRACE_ARMED\r\n");
+        }
+        return;
+    }
+    if (state == TRACE_IDLE || (uint32_t)(now - trace_last_row_ms) < TRACE_ROW_PERIOD_MS) {
+        return;
+    }
+
+    /* Pace the CSV so normal STAT and TRIAL lines retain TX queue space.
+       The first and last markers and every row are retried on backpressure. */
+    trace_last_row_ms = now;
+    __DMB();
+    if (state == TRACE_ABORTED) {
+        if (lg_log("TRACE_ABORT,%s\r\n", trace_abort_reason)) {
+            trace_state = TRACE_IDLE;
+        }
+        return;
+    }
+    if (!trace_begin_sent) {
+        trace_begin_sent = lg_log("TRACE_BEGIN,%u,%d,%d,%u,%u,%u\r\n",
+                                  (unsigned)SAMPLE_HZ, -TRACE_PRE_SLOTS, TRACE_POST_SLOTS,
+                                  trace_mode, trace_load, trace_threshold);
+        return;
+    }
+    if (trace_offset > TRACE_POST_SLOTS) {
+        if (lg_log("TRACE_END,%u,%u\r\n", trace_valid, trace_missing)) {
+            trace_state = TRACE_IDLE;
+        }
+        return;
+    }
+
+    uint32_t word;
+    if (trace_read(trace_offset, &word)) {
+        if (lg_log("TRACE_DATA,%d,%u,%u\r\n", trace_offset,
+                   (unsigned)(word & 0xfffu), (unsigned)((word >> 12) & 0xfffu))) {
+            ++trace_valid;
+            ++trace_offset;
+        }
+        return;
+    }
+    int gap = 1;
+    while (gap < TRACE_MAX_GAP_ROW && trace_offset + gap <= TRACE_POST_SLOTS &&
+           !trace_read(trace_offset + gap, &word)) {
+        ++gap;
+    }
+    if (lg_log("TRACE_GAP,%d,%d\r\n", trace_offset, gap)) {
+        trace_missing += (unsigned)gap;
+        trace_offset += gap;
+    }
+}
+
+static void update_threshold(void) {
+    const uint16_t baseline = beam_baseline;
+    beam_threshold = (uint16_t)(baseline * threshold_percent / 100u);
+    restore_threshold = (uint16_t)(beam_threshold + baseline / 20u);
+}
+
+static void reset_sound_window(void) {
+    sound_sum = 0;
+    sound_squares = 0;
+    sound_count = 0;
+}
+
+static void start_calibration(void) {
+    const uint32_t irq_state = __get_PRIMASK();
+    __disable_irq();
+    ready = false;
+    beam_active = false;
+    beam_run = 0;
+    sound_active = false;
+    calibration_light = 0;
+    calibration_noise = 0;
+    calibration_windows = 0;
+    reset_sound_window();
+    calibration_left = CAL_PAIRS;
+    event_read = event_write;
+    __set_PRIMASK(irq_state);
+}
+
+static void emit_event(uint8_t type, uint16_t value) {
+    if (type == LG_BEAM && trial.open && trial.valid &&
+        (!trial.ended || (uint32_t)(lg_millis() - trial.end_ms) <= TRIAL_TAIL_MS)) {
+        trial.hit = true;
+    }
+
+    const uint8_t write = event_write;
+    const uint8_t next = (write + 1u) % EVENT_CAPACITY;
+    if (next == event_read) {
+        ++lost_events;
+        return;
+    }
+    events[write] = (WindowEvent){ .type = type, .value = value };
+    __DMB();
+    event_write = next;
+}
+
+/* [SANGI] RMS of the high-passed microphone signal (cut-off ~200 Hz at 10 kHz).
+   Breath/wind is mostly low frequency and is removed; voice and music pass.
+   hp is kept in Q4 (x16), so sqrt(mean(hp^2)) is Q4 and is rounded back to ADC counts. */
+static uint16_t sound_rms(void) {
+    const uint32_t mean_square = (uint32_t)(sound_squares / SOUND_PAIRS);
+    uint32_t root = 0;
+    for (uint32_t bit = 32768u; bit != 0u; bit >>= 1) {
+        const uint32_t candidate = root | bit;
+        if (candidate * candidate <= mean_square) {
+            root = candidate;
+        }
+    }
+    return (uint16_t)((root + 8u) >> 4);
+}
+
+static void measure_sound(uint16_t microphone) {
+    if (!sound_lp_valid) {
+        sound_lp = (int32_t)microphone << 4;
+        sound_lp_valid = true;
+    }
+    const int32_t hp = ((int32_t)microphone << 4) - sound_lp;
+    sound_lp += hp >> 3; /* alpha = 1/8 */
+    sound_squares += (uint64_t)((int64_t)hp * hp);
+    if (++sound_count < SOUND_PAIRS) {
+        return;
+    }
+    const uint16_t rms = sound_rms();
+    reset_sound_window();
+    sampling.rms = rms;
+    if (calibration_left != 0u) {
+        calibration_noise += rms;
+        ++calibration_windows;
+    } else if (ready) {
+        if (rms >= sound_threshold && !sound_active) {
+            sound_active = true;
+            emit_event(LG_SOUND, rms);
+        } else if (rms * 4u < sound_threshold * 3u) {
+            sound_active = false;
+        }
+    }
+}
+
+static void measure_light(uint16_t light) {
+    if (calibration_left != 0u) {
+        calibration_light += light;
+        if (--calibration_left == 0u) {
+            beam_baseline = (uint16_t)(calibration_light / CAL_PAIRS);
+            update_threshold();
+            uint32_t noise = calibration_windows ? calibration_noise / calibration_windows : 0u;
+            sound_threshold = noise * 3u > SOUND_RMS_FLOOR ? (uint16_t)(noise * 3u) : SOUND_RMS_FLOOR;
+            ready = beam_baseline >= 100u && calibration_windows != 0u;
+        }
+        return;
+    }
+    if (!ready) {
+        return;
+    }
+    const bool changed = beam_active ? light >= restore_threshold : light < beam_threshold;
+    if (!changed) {
+        beam_run = 0;
+    } else if (++beam_run == DEBOUNCE_PAIRS) {
+        beam_run = 0;
+        beam_active = !beam_active;
+        if (beam_active) {
+            trace_beam_onset();
+            emit_event(LG_BEAM, light);
+        }
+    }
+}
+
+static void process_pair(uint32_t pair, uint16_t slot) {
+    /* [SANGI] Photoresistor/CdS module reads LOWER when brighter, so invert. */
+    const uint16_t light = (uint16_t)(4095u - (pair & 0x0fffu));
+    const uint16_t microphone = (pair >> 16) & 0x0fffu;
+    const uint16_t step = slot - last_slot;
+    if (step == 0u) {
+        return;
+    }
+    if (step > 1u) {
+        sampling.missing += step - 1u;
+        beam_run = 0;
+        reset_sound_window();
+    }
+    last_slot = slot;
+    ++sampling.pairs;
+    sampling.light = light;
+    if (light < sampling.min_light) {
+        sampling.min_light = light;
+    }
+    if (light > sampling.max_light) {
+        sampling.max_light = light;
+    }
+    trace_sample(light, microphone, step);
+    measure_sound(microphone);
+    measure_light(light);
+}
+
+static bool read_cpu_pair(uint32_t began, uint32_t *pair) {
+    while ((ADC1->SR & ADC_SR_EOC) == 0u || (ADC2->SR & ADC_SR_EOC) == 0u) {
+        if ((uint32_t)(DWT->CYCCNT - began) > LG_CPU_HZ / 10000u) {
+            acquisition_fault = true;
+            TIM3->CR1 = 0;
+            return false;
+        }
+    }
+    /* The upper ADC1_DR halfword is valid only when ADC1 DMA requests are
+       enabled. With DMA disabled read each converter's DR to clear its EOC. */
+    const uint32_t light = ADC1->DR & 0x0fffu;
+    const uint32_t microphone = ADC2->DR & 0x0fffu;
+    *pair = light | (microphone << 16);
+    return true;
+}
+
+void ADC1_2_IRQHandler(void) {
+    const uint32_t began = DWT->CYCCNT;
+    ++sampling.irqs;
+    if ((ADC1->SR & ADC_SR_EOC) != 0u) {
+        const uint16_t slot = (uint16_t)TIM4->CNT;
+        uint32_t pair;
+        if (read_cpu_pair(began, &pair)) {
+            process_pair(pair, slot);
+        }
+    }
+    sampling.cycles += DWT->CYCCNT - began;
+}
+
+void DMA1_Channel1_IRQHandler(void) {
+    const uint32_t began = DWT->CYCCNT;
+    ++sampling.irqs;
+    /* ISR and IFCR channel status/clear bits use the same positions. */
+    const uint32_t flags = DMA1->ISR & (DMA_ISR_HTIF1 | DMA_ISR_TCIF1 | DMA_ISR_TEIF1);
+    DMA1->IFCR = flags;
+    if ((flags & DMA_ISR_TEIF1) != 0u) {
+        TIM3->CR1 = 0;
+        acquisition_fault = true;
+        return;
+    }
+    if (flags == 0u) {
+        return;
+    }
+
+    /* TIM4 counts every trigger. CNDTR tracks written words, so the phases
+       differ by at most the one conversion currently in flight. */
+    uint32_t phase;
+    uint16_t trigger;
+    do {
+        trigger = (uint16_t)TIM4->CNT;
+        phase = (DMA_SIZE - DMA1_Channel1->CNDTR) & (DMA_SIZE - 1u);
+    } while (trigger != (uint16_t)TIM4->CNT);
+    const uint32_t lag = (trigger - phase) & (DMA_SIZE - 1u);
+    if (lag > 1u) {
+        acquisition_fault = true;
+        TIM3->CR1 = 0;
+        return;
+    }
+    const uint16_t end = (uint16_t)((trigger - lag) & ~(DMA_HALF - 1u));
+    const uint32_t offset = (end & DMA_HALF) ? 0u : DMA_HALF;
+    uint32_t snapshot[DMA_HALF];
+    for (unsigned i = 0; i < DMA_HALF; ++i) {
+        snapshot[i] = dma_buffer[offset + i];
+    }
+
+    /* If DMA started reusing this half during the copy, discard it. */
+    const uint32_t current_phase = (DMA_SIZE - DMA1_Channel1->CNDTR) & (DMA_SIZE - 1u);
+    if (((phase ^ current_phase) & DMA_HALF) == 0u && end != last_slot) {
+        for (unsigned i = 0; i < DMA_HALF; ++i) {
+            process_pair(snapshot[i], (uint16_t)(end - DMA_HALF + 1u + i));
+        }
+    }
+    sampling.cycles += DWT->CYCCNT - began;
+}
+
+static void poll_sample(void) {
+    const uint16_t slot = (uint16_t)TIM4->CNT;
+    if (slot == poll_slot) {
+        return;
+    }
+    const uint32_t began = DWT->CYCCNT;
+    poll_slot = slot;
+    ADC1->CR2 |= ADC_CR2_SWSTART;
+    uint32_t pair;
+    if (read_cpu_pair(began, &pair)) {
+        process_pair(pair, slot);
+    }
+    sampling.cycles += DWT->CYCCNT - began;
+}
+
+static bool adc_wait_clear(ADC_TypeDef *adc, uint32_t mask) {
+    const uint32_t began = DWT->CYCCNT;
+    while ((adc->CR2 & mask) != 0u) {
+        if ((uint32_t)(DWT->CYCCNT - began) > LG_CPU_HZ / 100u) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static bool calibrate_adc(ADC_TypeDef *adc) {
+    adc->CR2 |= ADC_CR2_RSTCAL;
+    if (!adc_wait_clear(adc, ADC_CR2_RSTCAL)) {
+        return false;
+    }
+    adc->CR2 |= ADC_CR2_CAL;
+    return adc_wait_clear(adc, ADC_CR2_CAL);
+}
+
+static void delay_adc(void) {
+    const uint32_t start = DWT->CYCCNT;
+    while ((uint32_t)(DWT->CYCCNT - start) < 20u * (LG_CPU_HZ / 1000000u)) {
+        __NOP();
+    }
+}
+
+static void start_sampling(Mode next_mode) {
+    TIM3->CR1 = 0;
+    NVIC_DisableIRQ(ADC1_2_IRQn);
+    NVIC_DisableIRQ(DMA1_Channel1_IRQn);
+    /* Allow an in-flight conversion to finish before clearing ADC and DMA. */
+    delay_adc();
+    ADC1->CR2 = ADC_CR2_ADON;
+    DMA1_Channel1->CCR = 0;
+    DMA1->IFCR = DMA_IFCR_CGIF1;
+    ADC1->SR = 0;
+    ADC2->SR = 0;
+    TIM3->CNT = 0;
+    TIM4->CNT = 0;
+    last_slot = 0;
+    poll_slot = 0;
+    sampling = (SamplingStats){ .min_light = 4095 };
+    beam_run = 0;
+    reset_sound_window();
+    mode = next_mode;
+    acquisition_fault = false;
+
+    /* RM0008 11.9.2: regular simultaneous mode, ADC1 master, ADC2 slave.
+       ADC1_DR holds ADC2 in bits 31:16 and ADC1 in bits 15:0. Only ADC1
+       triggers conversions. Select SWSTART on the slave and enable EXTTRIG. */
+    ADC2->CR2 = ADC_CR2_ADON | ADC_CR2_EXTSEL | ADC_CR2_EXTTRIG;
+    ADC1->CR1 = ADC_CR1_DUALMOD_1 | ADC_CR1_DUALMOD_2;
+    NVIC_ClearPendingIRQ(ADC1_2_IRQn);
+    NVIC_ClearPendingIRQ(DMA1_Channel1_IRQn);
+
+    switch (mode) {
+    case POLLING:
+        ADC1->CR2 = ADC_CR2_ADON | ADC_CR2_EXTTRIG | ADC_CR2_EXTSEL;
+        break;
+    case INTERRUPT:
+        ADC1->CR1 |= ADC_CR1_EOCIE;
+        ADC1->CR2 = ADC_CR2_ADON | ADC_CR2_EXTTRIG | ADC_CR2_EXTSEL_2;
+        NVIC_EnableIRQ(ADC1_2_IRQn);
+        break;
+    case DMA:
+        DMA1_Channel1->CPAR = (uint32_t)(uintptr_t)&ADC1->DR;
+        DMA1_Channel1->CMAR = (uint32_t)(uintptr_t)dma_buffer;
+        DMA1_Channel1->CNDTR = DMA_SIZE;
+        DMA1_Channel1->CCR = DMA_CCR_PL_1 | DMA_CCR_MSIZE_1 | DMA_CCR_PSIZE_1 |
+                              DMA_CCR_MINC | DMA_CCR_CIRC | DMA_CCR_HTIE |
+                              DMA_CCR_TCIE | DMA_CCR_TEIE | DMA_CCR_EN;
+        ADC1->CR2 = ADC_CR2_ADON | ADC_CR2_EXTTRIG | ADC_CR2_EXTSEL_2 | ADC_CR2_DMA;
+        NVIC_EnableIRQ(DMA1_Channel1_IRQn);
+        break;
+    }
+    TIM3->CR1 = TIM_CR1_CEN;
+}
+
+static void init_sampling(void) {
+    RCC->APB2ENR |= RCC_APB2ENR_ADC1EN | RCC_APB2ENR_ADC2EN;
+    RCC->AHBENR |= RCC_AHBENR_DMA1EN;
+    RCC->APB1ENR |= RCC_APB1ENR_TIM3EN | RCC_APB1ENR_TIM4EN;
+    (void)RCC->APB1ENR;
+    lg_gpio(GPIOA, 1, LG_GPIO_ANALOG);
+    lg_gpio(GPIOA, 4, LG_GPIO_ANALOG);
+
+    TIM3->PSC = 0;
+    TIM3->ARR = LG_CPU_HZ / SAMPLE_HZ - 1u;
+    TIM3->EGR = TIM_EGR_UG;
+    TIM3->SR = 0;
+    TIM3->CR2 = TIM_CR2_MMS_1; /* Update event as TRGO. */
+    TIM4->PSC = 0;
+    TIM4->ARR = 0xffffu;
+    TIM4->EGR = TIM_EGR_UG;
+    TIM4->SR = 0;
+    TIM4->SMCR = TIM_SMCR_TS_1 | TIM_SMCR_SMS; /* ITR2 = TIM3 TRGO, ext. clock. */
+    TIM4->CR1 = TIM_CR1_CEN;
+
+    /* Both ADCs use 71.5 ADC clock sampling cycles, plus 12.5 conversion. */
+    ADC1->SMPR2 = 6u << 3;
+    ADC2->SMPR2 = 6u << 12;
+    ADC1->SQR3 = 1u;
+    ADC2->SQR3 = 4u;
+    ADC1->CR2 = ADC_CR2_ADON;
+    ADC2->CR2 = ADC_CR2_ADON;
+    delay_adc();
+    adc_available = calibrate_adc(ADC1) && calibrate_adc(ADC2);
+    acquisition_fault = !adc_available;
+    if (adc_available) {
+        start_calibration();
+        start_sampling(DMA);
+    }
+}
+
+void EXTI0_IRQHandler(void) {
+    EXTI->PR = EXTI_PR_PR0;
+    const uint32_t now = lg_millis();
+    if (lg_read(GPIOB, 0)) {
+        if (trial.open) {
+            trial.valid = false;
+        } else {
+            trial.start_ms = now;
+            trial.end_ms = now;
+            trial.hit = false;
+            trial.ended = false;
+            trial.valid = ready && !beam_active && !acquisition_fault;
+            trial.open = true;
+        }
+    } else if (trial.open) {
+        trial.end_ms = now;
+        trial.ended = true;
+    }
+}
+
+static void init_trial_input(void) {
+    RCC->APB2ENR |= RCC_APB2ENR_AFIOEN;
+    (void)RCC->APB2ENR;
+    lg_gpio(GPIOB, 0, LG_GPIO_PULL);
+    GPIOB->BRR = 1u; /* Keep PB0 low when UNO is unplugged. */
+    AFIO->EXTICR[0] = (AFIO->EXTICR[0] & ~AFIO_EXTICR1_EXTI0) | AFIO_EXTICR1_EXTI0_PB;
+    EXTI->RTSR |= EXTI_RTSR_TR0;
+    EXTI->FTSR |= EXTI_FTSR_TR0;
+    EXTI->PR = EXTI_PR_PR0;
+    EXTI->IMR |= EXTI_IMR_MR0;
+    /* Equal preemption priority serializes trial state and ADC event updates. */
+    NVIC_SetPriority(EXTI0_IRQn, 2);
+    NVIC_SetPriority(ADC1_2_IRQn, 2);
+    NVIC_SetPriority(DMA1_Channel1_IRQn, 2);
+    NVIC_EnableIRQ(EXTI0_IRQn);
+}
+
+static void report_trial(void) {
+    const uint32_t irq_state = __get_PRIMASK();
+    __disable_irq();
+    const uint32_t now = lg_millis();
+    const bool complete = trial.open &&
+        (trial.ended ? (uint32_t)(now - trial.end_ms) > TRIAL_TAIL_MS
+                     : (uint32_t)(now - trial.start_ms) > 2000u);
+    const Trial finished = trial;
+    if (complete) {
+        trial.open = false;
+    }
+    __set_PRIMASK(irq_state);
+    if (complete) {
+        const uint32_t width = finished.ended ? finished.end_ms - finished.start_ms : 0u;
+        lg_log("TRIAL,%lu,%u,%u,%lu,%u,%u\r\n",
+               (unsigned long)finished.start_ms, (unsigned)mode, high_load ? 1u : 0u,
+               (unsigned long)width, finished.hit ? 1u : 0u,
+               finished.valid && finished.ended && !acquisition_fault ? 1u : 0u);
+    }
+}
+
+static void send_events(void) {
+    while (event_read != event_write) {
+        __DMB();
+        const WindowEvent event = events[event_read];
+        const uint8_t data[] = { (uint8_t)event.value, (uint8_t)(event.value >> 8) };
+        if (!lg_send(1, LG_NODE_A, event.type, data, sizeof(data))) {
+            return;
+        }
+        event_read = (event_read + 1u) % EVENT_CAPACITY;
+    }
+}
+
+static void send_heartbeat(void) {
+    static uint8_t seq;
+    const uint8_t flags = (ready && !acquisition_fault ? LG_READY : 0u) |
+        (beam_active ? LG_ACTIVE : 0u) |
+        (acquisition_fault || (!ready && calibration_left == 0u) ? LG_SENSOR_FAULT : 0u);
+    const uint8_t data[] = { seq++, flags, (uint8_t)mode };
+    (void)lg_send(1, LG_NODE_A, LG_HEARTBEAT, data, sizeof(data));
+}
+
+static void handle_hub(void) {
+    static LgParser parser;
+    LgFrame frame;
+    while (lg_recv(1, &parser, &frame)) {
+        if (frame.id != LG_HUB) {
+            continue;
+        }
+        const uint8_t value = frame.len != 0u ? frame.data[0] : 0u;
+        const bool idle = !trial.open && !lg_read(GPIOB, 0);
+        bool accepted = false;
+        switch (frame.type) {
+        case LG_MODE:
+            accepted = idle && adc_available && frame.len == 1u && value <= DMA;
+            if (accepted && ((Mode)value != mode || acquisition_fault)) {
+                trace_abort_if_active("configuration_changed");
+                start_sampling((Mode)value);
+            }
+            break;
+        case LG_LOAD:
+            accepted = idle && frame.len == 1u && value <= 1u;
+            if (accepted) {
+                if (high_load != (value != 0u)) {
+                    trace_abort_if_active("configuration_changed");
+                }
+                high_load = value != 0u;
+            }
+            break;
+        case LG_CAL:
+            accepted = idle && adc_available && !acquisition_fault && frame.len == 0u;
+            if (accepted) {
+                trace_abort_if_active("configuration_changed");
+                start_calibration();
+            }
+            break;
+        default:
+            continue;
+        }
+        const uint8_t ack[] = { frame.type, value, accepted ? 0u : 1u };
+        (void)lg_send(1, LG_NODE_A, LG_ACK, ack, sizeof(ack));
+        if (accepted) {
+            send_heartbeat();
+        }
+    }
+}
+
+static void handle_vcp(void) {
+    static char command[8];
+    static uint8_t length;
+    static bool too_long;
+    uint8_t byte;
+    while (lg_uart_read(2, &byte)) {
+        if (byte != '\r' && byte != '\n') {
+            if (length < sizeof(command)) {
+                command[length++] = (char)byte;
+            } else {
+                too_long = true;
+            }
+            continue;
+        }
+        if (!too_long && length == 5u && memcmp(command, "TRACE", 5u) == 0) {
+            trace_start();
+        } else if (!too_long && length == 4u && memcmp(command, "PLOT", 4u) == 0) {
+            ldr_plot_log = true;
+            lg_log("PLOT_ON,5Hz\r\n");
+        } else if (!too_long && length == 7u && memcmp(command, "PLOTOFF", 7u) == 0) {
+            ldr_plot_log = false;
+            lg_log("PLOT_OFF\r\n");
+        } else if (!too_long && length == 5u && command[0] == 'T' && command[1] == 'H' &&
+            command[2] == ' ' && command[3] >= '1' && command[3] <= '9' &&
+            command[4] >= '0' && command[4] <= '9' && !trial.open) {
+            const unsigned percent = (unsigned)(command[3] - '0') * 10u + (unsigned)(command[4] - '0');
+            if (percent <= 95u) {
+                if (percent != threshold_percent) {
+                    trace_abort_if_active("configuration_changed");
+                }
+                const uint32_t irq_state = __get_PRIMASK();
+                __disable_irq();
+                threshold_percent = (uint8_t)percent;
+                update_threshold();
+                beam_run = 0;
+                __set_PRIMASK(irq_state);
+                lg_log("TH,%u\r\n", percent);
+            }
+        }
+        length = 0;
+        too_long = false;
+    }
+}
+
+static void report_samples(uint32_t now) {
+    static SamplingStats previous;
+    static uint16_t previous_slot;
+    static uint32_t previous_ms;
+    static Mode previous_mode = DMA;
+    static bool previous_load;
+    if ((uint32_t)(now - previous_ms) < 1000u) {
+        return;
+    }
+    const uint32_t irq_state = __get_PRIMASK();
+    __disable_irq();
+    const uint16_t slot = (uint16_t)TIM4->CNT;
+    const SamplingStats snapshot = sampling;
+    sampling.min_light = 4095;
+    sampling.max_light = 0;
+    __set_PRIMASK(irq_state);
+
+    /* Skip the transition interval. DMA can have a partial block pending:
+       use observed slot gaps for the loss metric, not slots - processed. */
+    if (previous_mode == mode && previous_load == high_load && previous_ms != 0u &&
+        snapshot.pairs >= previous.pairs) {
+        const uint32_t elapsed_ms = now - previous_ms;
+        const uint32_t cycles = snapshot.cycles - previous.cycles;
+        const uint32_t per_mille = (uint32_t)((uint64_t)cycles * 1000u /
+            ((uint64_t)elapsed_ms * (LG_CPU_HZ / 1000u)));
+        const uint32_t pairs = snapshot.pairs - previous.pairs;
+        if (pairs == 0u) {
+            acquisition_fault = true;
+        }
+        lg_log("STAT,%lu,%u,%u,%u,%lu,%lu,%lu,%lu,%lu,%u,%u,%u,%u,%u,%u,%u,%lu\r\n",
+               (unsigned long)now, (unsigned)mode, high_load ? 1u : 0u,
+               (unsigned)(uint16_t)(slot - previous_slot), (unsigned long)pairs,
+               (unsigned long)(snapshot.missing - previous.missing), (unsigned long)cycles,
+               (unsigned long)per_mille, (unsigned long)(snapshot.irqs - previous.irqs),
+               (unsigned)snapshot.light, (unsigned)snapshot.min_light,
+               (unsigned)snapshot.max_light, (unsigned)beam_baseline, (unsigned)beam_threshold,
+               (unsigned)snapshot.rms, ready && !acquisition_fault ? 1u : 0u, (unsigned long)lost_events);
+    }
+    previous = snapshot;
+    previous_slot = slot;
+    previous_ms = now;
+    previous_mode = mode;
+    previous_load = high_load;
+}
+
+static void update_ldr_plot(uint32_t now) {
+    static uint32_t last_sample_ms, last_update_ms;
+    static uint32_t sum;
+    static unsigned count;
+    static int32_t filtered;
+    static bool initialized;
+
+    if (now - last_sample_ms < LDR_PLOT_SAMPLE_MS) {
+        return;
+    }
+    last_sample_ms = now;
+    if (!ready || acquisition_fault || sampling.pairs == 0u) {
+        last_update_ms = now;
+        sum = 0;
+        count = 0;
+        initialized = false;
+        return;
+    }
+
+    /* Read the latest LDR sample once, even if the foreground was busy. */
+    sum += sampling.light;
+    ++count;
+    if (now - last_update_ms < LDR_PLOT_UPDATE_MS) {
+        return;
+    }
+    last_update_ms = now;
+
+    /* Mean over the display interval and limit changes on the display only. */
+    const int32_t target = (int32_t)((sum * LDR_PLOT_SCALE + count / 2u) / count);
+    if (initialized) {
+        const int32_t max_step = LDR_PLOT_MAX_STEP * LDR_PLOT_SCALE;
+        int32_t step = (target - filtered) / LDR_PLOT_FILTER_DIVISOR;
+        if (step > max_step) {
+            step = max_step;
+        } else if (step < -max_step) {
+            step = -max_step;
+        }
+        filtered += step;
+    } else {
+        filtered = target;
+        initialized = true;
+    }
+    const uint16_t displayed = (uint16_t)((filtered + LDR_PLOT_SCALE / 2) / LDR_PLOT_SCALE);
+    ldr_plot_5hz = displayed;
+    if (ldr_plot_log) {
+        lg_log("PLOT,%lu,%u\r\n", (unsigned long)now, (unsigned)displayed);
+    }
+    sum = 0;
+    count = 0;
+}
+
+static void apply_foreground_load(uint32_t now) {
+    static uint32_t last_ms;
+    if (high_load && (uint32_t)(now - last_ms) >= 50u) {
+        last_ms = now;
+        /* 8 ms elapsed with interrupts enabled, identical across modes. */
+        const uint32_t began = DWT->CYCCNT;
+        while ((uint32_t)(DWT->CYCCNT - began) < 8u * (LG_CPU_HZ / 1000u)) {
+            __NOP();
+        }
+    }
+}
+
+int main(void) {
+    lg_init();
+    lg_uart_init(1, 38400);
+    lg_uart_init(2, 115200);
+    init_trial_input();
+    init_sampling();
+    lg_log("A,10kHz,PA1 LDR,PA4 microphone,PB0 trial,TH 10-95,TRACE,PLOT/PLOTOFF\r\n");
+    lg_log("TRIAL,start_ms,mode,load,command_ms,hit,valid\r\n");
+    lg_log("STAT,time_ms,mode,load,slots,pairs,skipped,acq_cycles,acq_permille,acq_irqs,"
+           "ldr,min,max,lit_baseline,ldr_threshold,mic_rms,ready,event_drops\r\n");
+    send_heartbeat();
+    uint32_t last_heartbeat = lg_millis();
+    for (;;) {
+        if (mode == POLLING && !acquisition_fault) {
+            poll_sample();
+        }
+        lg_uart_service();
+        handle_hub();
+        handle_vcp();
+        send_events();
+        const uint32_t now = lg_millis();
+        report_trial();
+        if ((uint32_t)(now - last_heartbeat) >= HEARTBEAT_MS) {
+            send_heartbeat();
+            last_heartbeat = now;
+        }
+        report_samples(now);
+        trace_service(now);
+        update_ldr_plot(now);
+        apply_foreground_load(now);
+    }
+}

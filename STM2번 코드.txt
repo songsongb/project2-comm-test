@@ -1,0 +1,320 @@
+#include "laser_guard.h"
+
+/* B: PA0 = Hall analog output, PA8 = shock switch/module signal. */
+#define HALL_SAMPLE_HZ 1000u
+#define HALL_DMA_HALF 16u
+#define HALL_CAL_SAMPLES 300u
+#define HALL_CAL_MAX_SPREAD 100u
+#define HALL_OPEN_DELTA 180u
+#define HALL_CLOSE_DELTA 120u
+#define HALL_STABLE_SAMPLES 50u
+#define HALL_BLOCK_TIMEOUT_MS 100u
+
+/* 1: idle high, falling edge (e.g. KY-002). 0: idle low, rising edge. */
+#define SHOCK_ACTIVE_LOW 1
+#define SHOCK_PULSES 3u
+#define SHOCK_WINDOW_MS 100u
+#define SHOCK_DEBOUNCE_MS 8u
+#define SHOCK_REARM_MS 150u
+#define SHOCK_LINE (1u << 8)
+
+static volatile uint16_t hall_dma[2u * HALL_DMA_HALF];
+static volatile uint16_t hall_raw;
+static volatile uint16_t hall_closed;
+static volatile uint32_t hall_sample_ms;
+static volatile bool hall_ready;
+static volatile bool hall_cal_fault;
+static volatile bool hall_dma_fault;
+static volatile bool door_open;
+static volatile uint32_t door_revision;
+
+static uint32_t hall_cal_total;
+static uint16_t hall_cal_count;
+static uint16_t hall_cal_min;
+static uint16_t hall_cal_max;
+static uint16_t hall_transition_count;
+
+static uint32_t shock_edge_ms = 0u - SHOCK_DEBOUNCE_MS;
+static uint32_t shock_event_ms = 0u - SHOCK_REARM_MS;
+static uint32_t shock_timestamps[SHOCK_PULSES];
+static uint32_t shock_next;
+static uint32_t shock_count;
+static volatile uint32_t shock_edges;
+static volatile uint32_t shock_events;
+
+static uint16_t hall_delta(uint16_t value, uint16_t closed)
+{
+    return value >= closed ? value - closed : closed - value;
+}
+
+static void hall_begin_calibration(void)
+{
+    uint32_t primask = __get_PRIMASK();
+    __disable_irq();
+    hall_ready = false;
+    hall_cal_fault = false;
+    hall_cal_total = 0u;
+    hall_cal_count = 0u;
+    hall_cal_min = UINT16_MAX;
+    hall_cal_max = 0u;
+    hall_transition_count = 0u;
+    door_open = false;
+    __set_PRIMASK(primask);
+}
+
+static void hall_process_sample(uint16_t sample)
+{
+    hall_raw = sample;
+
+    if (!hall_ready) {
+        if (hall_cal_fault) {
+            return;
+        }
+        hall_cal_total += sample;
+        if (sample < hall_cal_min) {
+            hall_cal_min = sample;
+        }
+        if (sample > hall_cal_max) {
+            hall_cal_max = sample;
+        }
+        if (++hall_cal_count == HALL_CAL_SAMPLES) {
+            hall_closed = (uint16_t)(hall_cal_total / HALL_CAL_SAMPLES);
+            hall_cal_fault = hall_delta(hall_cal_max, hall_cal_min) > HALL_CAL_MAX_SPREAD;
+            hall_ready = !hall_cal_fault;
+        }
+        return;
+    }
+
+    uint16_t delta = hall_delta(sample, hall_closed);
+    bool change = door_open ? delta <= HALL_CLOSE_DELTA : delta >= HALL_OPEN_DELTA;
+    if (!change) {
+        hall_transition_count = 0u;
+    } else if (++hall_transition_count == HALL_STABLE_SAMPLES) {
+        hall_transition_count = 0u;
+        door_open = !door_open;
+        ++door_revision;
+    }
+}
+
+static bool hall_init(void)
+{
+    RCC->APB2ENR |= RCC_APB2ENR_IOPAEN | RCC_APB2ENR_ADC1EN;
+    RCC->APB1ENR |= RCC_APB1ENR_TIM3EN;
+    RCC->AHBENR |= RCC_AHBENR_DMA1EN;
+    lg_gpio(GPIOA, 0u, LG_GPIO_ANALOG); /* ADC1_IN0 */
+
+    TIM3->PSC = SystemCoreClock / 1000000u - 1u;
+    TIM3->ARR = 1000000u / HALL_SAMPLE_HZ - 1u;
+    TIM3->EGR = TIM_EGR_UG;
+    TIM3->SR = 0u;
+    TIM3->CR2 = TIM_CR2_MMS_1; /* Update event -> TRGO */
+
+    ADC1->CR1 = 0u;
+    ADC1->SMPR2 = ADC_SMPR2_SMP0_2 | ADC_SMPR2_SMP0_0; /* 55.5 cycles */
+    ADC1->SQR1 = 0u; /* One conversion. */
+    ADC1->SQR3 = 0u; /* First conversion uses channel 0. */
+    ADC1->CR2 = ADC_CR2_ADON;
+
+    uint32_t start = lg_millis();
+    while ((uint32_t)(lg_millis() - start) < 2u) {
+    }
+
+    ADC1->CR2 |= ADC_CR2_RSTCAL;
+    start = lg_millis();
+    while ((ADC1->CR2 & ADC_CR2_RSTCAL) != 0u) {
+        if ((uint32_t)(lg_millis() - start) >= 5u) {
+            return false;
+        }
+    }
+    ADC1->CR2 |= ADC_CR2_CAL;
+    start = lg_millis();
+    while ((ADC1->CR2 & ADC_CR2_CAL) != 0u) {
+        if ((uint32_t)(lg_millis() - start) >= 5u) {
+            return false;
+        }
+    }
+
+    DMA1_Channel1->CCR = 0u;
+    DMA1->IFCR = DMA_IFCR_CGIF1;
+    DMA1_Channel1->CPAR = (uint32_t)(uintptr_t)&ADC1->DR;
+    DMA1_Channel1->CMAR = (uint32_t)(uintptr_t)hall_dma;
+    DMA1_Channel1->CNDTR = 2u * HALL_DMA_HALF;
+    NVIC_SetPriority(DMA1_Channel1_IRQn, 2u);
+    NVIC_EnableIRQ(DMA1_Channel1_IRQn);
+    DMA1_Channel1->CCR = DMA_CCR_MINC | DMA_CCR_CIRC | DMA_CCR_PSIZE_0
+                        | DMA_CCR_MSIZE_0 | DMA_CCR_PL_1 | DMA_CCR_HTIE | DMA_CCR_TCIE
+                        | DMA_CCR_TEIE | DMA_CCR_EN;
+    ADC1->CR2 = ADC_CR2_ADON | ADC_CR2_DMA | ADC_CR2_EXTTRIG | ADC_CR2_EXTSEL_2;
+    hall_sample_ms = lg_millis();
+    TIM3->CR1 = TIM_CR1_CEN;
+    return true;
+}
+
+void DMA1_Channel1_IRQHandler(void)
+{
+    uint32_t status = DMA1->ISR;
+    uint32_t completed = status & (DMA_ISR_HTIF1 | DMA_ISR_TCIF1);
+
+    if ((status & DMA_ISR_TEIF1) != 0u
+        || completed == (DMA_ISR_HTIF1 | DMA_ISR_TCIF1)) {
+        TIM3->CR1 = 0u;
+        DMA1_Channel1->CCR = 0u;
+        DMA1->IFCR = DMA_IFCR_CGIF1;
+        hall_dma_fault = true;
+        return;
+    }
+    if (completed == 0u) {
+        return;
+    }
+
+    /* ADC DMA IRQ priority stays above the application; the half buffer
+       will be stable for another 16 ms at this rate. */
+    DMA1->IFCR = completed == DMA_ISR_HTIF1 ? DMA_IFCR_CHTIF1 : DMA_IFCR_CTCIF1;
+    uint32_t offset = completed == DMA_ISR_HTIF1 ? 0u : HALL_DMA_HALF;
+    for (uint32_t i = 0u; i < HALL_DMA_HALF; ++i) {
+        hall_process_sample(hall_dma[offset + i]);
+    }
+    hall_sample_ms = lg_millis();
+}
+
+static void shock_init(void)
+{
+    RCC->APB2ENR |= RCC_APB2ENR_AFIOEN | RCC_APB2ENR_IOPAEN;
+    lg_gpio(GPIOA, 8u, LG_GPIO_PULL);
+    lg_write(GPIOA, 8u, SHOCK_ACTIVE_LOW);
+    AFIO->EXTICR[2] &= ~0x0fu; /* EXTI8 -> port A */
+
+    EXTI->FTSR &= ~SHOCK_LINE;
+    EXTI->RTSR &= ~SHOCK_LINE;
+    if (SHOCK_ACTIVE_LOW) {
+        EXTI->FTSR |= SHOCK_LINE;
+    } else {
+        EXTI->RTSR |= SHOCK_LINE;
+    }
+    EXTI->PR = SHOCK_LINE;
+    EXTI->IMR |= SHOCK_LINE;
+    NVIC_SetPriority(EXTI9_5_IRQn, 3u);
+    NVIC_EnableIRQ(EXTI9_5_IRQn);
+}
+
+void EXTI9_5_IRQHandler(void)
+{
+    if ((EXTI->PR & SHOCK_LINE) == 0u) {
+        return;
+    }
+    EXTI->PR = SHOCK_LINE;
+
+    uint32_t now = lg_millis();
+    if ((uint32_t)(now - shock_edge_ms) < SHOCK_DEBOUNCE_MS) {
+        return;
+    }
+    shock_edge_ms = now;
+    ++shock_edges;
+    if ((uint32_t)(now - shock_event_ms) < SHOCK_REARM_MS) {
+        return;
+    }
+
+    shock_timestamps[shock_next] = now;
+    shock_next = (shock_next + 1u) % SHOCK_PULSES;
+    if (shock_count < SHOCK_PULSES) {
+        ++shock_count;
+    }
+    if (shock_count == SHOCK_PULSES
+        && (uint32_t)(now - shock_timestamps[shock_next]) <= SHOCK_WINDOW_MS) {
+        shock_count = 0u;
+        shock_event_ms = now;
+        ++shock_events;
+    }
+}
+
+int main(void)
+{
+    lg_init();
+    lg_uart_init(1u, 38400u);
+    lg_uart_init(2u, 115200u);
+    hall_begin_calibration();
+    if (!hall_init()) {
+        hall_dma_fault = true;
+    }
+    shock_init();
+    lg_log("B,door,hall=PA0,shock=PA8\r\n");
+    lg_log("ms,raw,closed,delta,ready,open,shock_edges,fault\r\n");
+
+    LgParser parser = {0};
+    LgFrame frame;
+    uint32_t last_heartbeat = lg_millis() - 200u;
+    uint32_t last_diag = lg_millis();
+    uint32_t sent_door_revision = 0u;
+    uint32_t sent_shocks = 0u;
+    uint8_t seq = 0u;
+    uint8_t last_flags = 0u;
+    bool cal_ack_pending = false;
+    uint8_t cal_result = 0u;
+
+    for (;;) {
+        lg_uart_service();
+        uint32_t now = lg_millis();
+        if ((int32_t)(now - hall_sample_ms) > (int32_t)HALL_BLOCK_TIMEOUT_MS) {
+            hall_dma_fault = true;
+        }
+
+        while (lg_recv(1u, &parser, &frame)) {
+            if (frame.id == LG_HUB && frame.type == LG_CAL && frame.len == 0u) {
+                cal_result = hall_dma_fault ? 1u : 0u;
+                if (cal_result == 0u) {
+                    hall_begin_calibration();
+                    sent_door_revision = door_revision;
+                }
+                cal_ack_pending = true;
+            }
+        }
+
+        if (cal_ack_pending) {
+            uint8_t reply[] = {LG_CAL, 0u, cal_result};
+            cal_ack_pending = !lg_send(1u, LG_NODE_B, LG_ACK, reply, sizeof reply);
+        }
+
+        /* Capture related ISR fields together so state and event revision agree. */
+        uint32_t primask = __get_PRIMASK();
+        __disable_irq();
+        bool fault = hall_cal_fault || hall_dma_fault;
+        bool ready = hall_ready && !fault;
+        bool open = door_open && ready;
+        uint16_t raw = hall_raw;
+        uint16_t closed = hall_closed;
+        uint32_t door_pending = door_revision;
+        __set_PRIMASK(primask);
+
+        if (ready && door_pending != sent_door_revision) {
+            uint8_t data[] = {open, (uint8_t)raw, (uint8_t)(raw >> 8)};
+            if (lg_send(1u, LG_NODE_B, LG_DOOR, data, sizeof data)) {
+                sent_door_revision = door_pending;
+            }
+        }
+        if (shock_events != sent_shocks) {
+            uint8_t data[] = {SHOCK_PULSES};
+            if (lg_send(1u, LG_NODE_B, LG_SHOCK, data, sizeof data)) {
+                ++sent_shocks;
+            }
+        }
+
+        uint8_t flags = (ready ? LG_READY : 0u) | (open ? LG_ACTIVE : 0u)
+                      | (fault ? LG_SENSOR_FAULT : 0u);
+        if ((uint32_t)(now - last_heartbeat) >= 200u || flags != last_flags) {
+            uint8_t data[] = {seq, flags};
+            if (lg_send(1u, LG_NODE_B, LG_HEARTBEAT, data, sizeof data)) {
+                ++seq;
+                last_flags = flags;
+                last_heartbeat = now;
+            }
+        }
+
+        if ((uint32_t)(now - last_diag) >= 1000u) {
+            last_diag = now;
+            lg_log("%lu,%u,%u,%u,%u,%u,%lu,%u\r\n",
+                   (unsigned long)now, (unsigned int)raw, (unsigned int)closed,
+                   (unsigned int)hall_delta(raw, closed), (unsigned int)ready,
+                   (unsigned int)open, (unsigned long)shock_edges, (unsigned int)fault);
+        }
+    }
+}
