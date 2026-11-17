@@ -94,3 +94,178 @@ void stopTest(uint32_t now) {
   phaseStarted = now;
   delayUntilNextPulse = BETWEEN_PULSES_MS;
   phase = RECOVERY;
+}
+
+void serviceTest(uint32_t now) {
+  if (phase != IDLE && !cancelled && hubState != 0) {
+    stopTest(now);
+  }
+  switch (phase) {
+    case IDLE:
+      break;
+    case READY_DELAY:
+      if (now - phaseStarted >= delayUntilNextPulse) {
+        ++pulseNumber;
+        --remaining;
+        phase = LASER_OFF;
+        phaseStarted = now;
+        digitalWrite(PULSE_REFERENCE, HIGH);
+        setLaser(false);
+      }
+      break;
+    case LASER_OFF:
+      if (now - phaseStarted >= pulseWidth) {
+        setLaser(true);
+        digitalWrite(PULSE_REFERENCE, LOW);
+        const uint32_t offMs = now - phaseStarted;
+        phaseStarted = now;
+        phase = RECOVERY;
+        Serial.print(F("pulse,"));
+        Serial.print(pulseNumber);
+        Serial.print(',');
+        Serial.println(offMs);
+        // Vary spacing so short pulses do not repeatedly hit the same load phase.
+        delayUntilNextPulse = BETWEEN_PULSES_MS + (pulseNumber * 73u) % 197u;
+      }
+      break;
+    case RECOVERY:
+      if (now - phaseStarted >= delayUntilNextPulse) {
+        if (remaining) {
+          phase = READY_DELAY;
+          delayUntilNextPulse = 0;
+        } else {
+          finishTest();
+        }
+      }
+      break;
+  }
+}
+
+void serviceHub(uint32_t now) {
+  const uint8_t raw = (digitalRead(HUB_BIT_0) == HIGH ? 1u : 0u)
+                    | (digitalRead(HUB_BIT_1) == HIGH ? 2u : 0u);
+  if (raw != hubCandidate) {
+    hubCandidate = raw;
+    hubCandidateSince = now;
+  } else if (now - hubCandidateSince >= STABLE_INPUT_MS) {
+    hubState = raw;
+  }
+
+  uint8_t shown = hubState;
+  const uint32_t demoAge = now - demoStarted;
+  if (localDemo && demoAge < 4000u && hubState == 0) {
+    shown = demoAge / 1000u;
+  } else {
+    localDemo = false;
+  }
+  const bool blink = (now / 180u) % 2u == 0u;
+  switch (shown) {
+    case 0:
+      setColor(0, 255, 0);
+      setBuzzer(false);
+      break;
+    case 1:
+      setColor(255, 160, 0);
+      setBuzzer(false);
+      break;
+    case 2:
+      setColor(blink ? 255 : 0, 0, 0);
+      setBuzzer(blink);
+      break;
+    default:
+      setColor(140, 0, 255);
+      setBuzzer(false);
+      break;
+  }
+}
+
+void serviceButton(uint32_t now) {
+  const bool raw = digitalRead(TEST_BUTTON) == LOW;
+  if (raw != buttonCandidate) {
+    buttonCandidate = raw;
+    buttonCandidateSince = now;
+  } else if (raw != buttonPressed && now - buttonCandidateSince >= STABLE_INPUT_MS) {
+    buttonPressed = raw;
+    if (buttonPressed) {
+      if (phase == IDLE) {
+        startTest(BUTTON_PULSE_MS, 1, now);
+      } else {
+        stopTest(now);
+      }
+    }
+  }
+}
+
+void runCommand(uint32_t now) {
+  int width, count;
+  char extra;
+  if (strcmp(command, "STOP") == 0) {
+    stopTest(now);
+  } else if (strcmp(command, "LASER ON") == 0 && phase == IDLE) {
+    setLaser(true);
+    Serial.println(F("LASER_ON"));
+  } else if (strcmp(command, "LASER OFF") == 0 && phase == IDLE) {
+    setLaser(false);
+    Serial.println(F("LASER_OFF"));
+  } else if (strcmp(command, "DEMO") == 0 && phase == IDLE && hubState == 0) {
+    demoStarted = now;
+    localDemo = true;
+  } else if (sscanf(command, "TEST %d %d %c", &width, &count, &extra) == 2
+             && width >= (int)MIN_PULSE_MS && width <= (int)MAX_PULSE_MS
+             && count >= 1 && count <= 100) {
+    startTest(width, count, now);
+  } else {
+    Serial.println(F("LASER ON | LASER OFF | DEMO | TEST 50..400 1..100 | STOP"));
+  }
+}
+
+void serviceSerial(uint32_t now) {
+  // Bound UART parsing per loop so it cannot starve the relay scheduler.
+  for (uint8_t i = 0; i < 16 && Serial.available() > 0; ++i) {
+    char ch = (char)Serial.read();
+    if (ch == '\r' || ch == '\n') {
+      if (commandOverflow) {
+        Serial.println(F("COMMAND_TOO_LONG"));
+      } else if (commandLength) {
+        command[commandLength] = '\0';
+        runCommand(now);
+      }
+      commandLength = 0;
+      commandOverflow = false;
+    } else if (commandLength < sizeof(command) - 1) {
+      command[commandLength++] = ch;
+    } else {
+      commandOverflow = true;
+    }
+  }
+}
+
+void setup() {
+  // Keep the relay inactive when changing the pin direction.
+  setLaser(false);
+  pinMode(RELAY, OUTPUT);
+  setBuzzer(false);
+  pinMode(BUZZER, OUTPUT);
+  pinMode(RED, OUTPUT);
+  pinMode(GREEN, OUTPUT);
+  pinMode(BLUE, OUTPUT);
+  pinMode(HUB_BIT_0, INPUT);
+  pinMode(HUB_BIT_1, INPUT);
+  pinMode(TEST_ACTIVE, OUTPUT);
+  pinMode(PULSE_REFERENCE, OUTPUT);
+  pinMode(TEST_BUTTON, INPUT_PULLUP);
+  digitalWrite(TEST_ACTIVE, LOW);
+  digitalWrite(PULSE_REFERENCE, LOW);
+  setColor(0, 0, 0);
+  Serial.begin(115200);
+  setLaser(true);
+  Serial.println(F("Laser Guard D ready. Enter HELP for commands."));
+}
+
+void loop() {
+  const uint32_t now = millis();
+  serviceHub(now);
+  serviceTest(now);
+  serviceButton(now);
+  serviceSerial(now);
+}
