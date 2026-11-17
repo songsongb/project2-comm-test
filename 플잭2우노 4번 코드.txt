@@ -1,0 +1,96 @@
+#include <Arduino.h>
+#include <stdio.h>
+#include <string.h>
+
+// Arduino UNO R3. The relay's NO contact supplies the laser module.
+constexpr uint8_t HUB_BIT_0 = 2;
+constexpr uint8_t HUB_BIT_1 = 3;
+constexpr uint8_t TEST_ACTIVE = 4;
+constexpr uint8_t TEST_BUTTON = 6;
+constexpr uint8_t PULSE_REFERENCE = 7;
+constexpr uint8_t BUZZER = 8;
+constexpr uint8_t RED = 9;
+constexpr uint8_t GREEN = 10;
+constexpr uint8_t BLUE = 11;
+constexpr uint8_t RELAY = 12;
+
+constexpr bool RELAY_ACTIVE_LOW = true;
+constexpr bool BUZZER_ACTIVE_LOW = false;
+constexpr bool RGB_COMMON_ANODE = false;
+constexpr unsigned BUTTON_PULSE_MS = 150;
+constexpr unsigned MIN_PULSE_MS = 50;
+constexpr unsigned MAX_PULSE_MS = 400;
+constexpr unsigned BETWEEN_PULSES_MS = 1050;
+constexpr unsigned LASER_WARMUP_MS = 1000;
+constexpr unsigned STABLE_INPUT_MS = 30;
+
+enum TestPhase { IDLE, READY_DELAY, LASER_OFF, RECOVERY };
+TestPhase phase = IDLE;
+uint32_t phaseStarted;
+uint32_t delayUntilNextPulse;
+unsigned pulseWidth;
+unsigned remaining;
+unsigned pulseNumber;
+bool cancelled;
+
+uint8_t hubCandidate = 0;
+uint8_t hubState = 0;
+uint32_t hubCandidateSince;
+bool buttonCandidate = false;
+bool buttonPressed = false;
+uint32_t buttonCandidateSince;
+bool localDemo = false;
+uint32_t demoStarted;
+
+char command[40];
+uint8_t commandLength = 0;
+bool commandOverflow = false;
+
+void setLaser(bool on) {
+  digitalWrite(RELAY, on != RELAY_ACTIVE_LOW ? HIGH : LOW);
+}
+
+void setBuzzer(bool on) {
+  digitalWrite(BUZZER, on != BUZZER_ACTIVE_LOW ? HIGH : LOW);
+}
+
+void setColor(uint8_t red, uint8_t green, uint8_t blue) {
+  analogWrite(RED, RGB_COMMON_ANODE ? 255 - red : red);
+  analogWrite(GREEN, RGB_COMMON_ANODE ? 255 - green : green);
+  analogWrite(BLUE, RGB_COMMON_ANODE ? 255 - blue : blue);
+}
+
+void startTest(unsigned width, unsigned count, uint32_t now) {
+  if (phase != IDLE || localDemo || hubState != 0) {
+    Serial.println(F("BUSY_OR_HUB_NOT_NORMAL"));
+    return;
+  }
+  pulseWidth = width;
+  remaining = count;
+  pulseNumber = 0;
+  cancelled = false;
+  phaseStarted = now;
+  delayUntilNextPulse = LASER_WARMUP_MS;
+  phase = READY_DELAY;
+  digitalWrite(TEST_ACTIVE, HIGH);
+  setLaser(true);
+  Serial.println(F("TEST_STARTED"));
+}
+
+void finishTest() {
+  phase = IDLE;
+  digitalWrite(TEST_ACTIVE, LOW);
+  Serial.println(cancelled ? F("TEST_ABORTED") : F("TEST_DONE"));
+}
+
+void stopTest(uint32_t now) {
+  if (phase == IDLE) {
+    return;
+  }
+  setLaser(true);
+  digitalWrite(PULSE_REFERENCE, LOW);
+  cancelled = true;
+  remaining = 0;
+  phaseStarted = now;
+  delayUntilNextPulse = BETWEEN_PULSES_MS;
+  phase = RECOVERY;

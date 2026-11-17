@@ -1,0 +1,492 @@
+#include "laser_guard.h"
+
+#include <stdbool.h>
+#include <stdint.h>
+#include <string.h>
+
+enum {
+    HEARTBEAT_TIMEOUT_MS = 600,
+    COMMAND_TIMEOUT_MS = 100,
+    DOOR_DELAY_MS = 10000,
+    SUSPICION_MS = 5000,
+    COMBINATION_MS = 500,
+    BUTTON_DEBOUNCE_MS = 35
+};
+
+typedef enum {
+    DISARMED, ARMED, SUSPECT, ALARM, FAULT
+} HubState;
+
+typedef enum {
+    LINK_STARTING, LINK_LOST, SENSOR_WAIT, SENSOR_FAULT, NODE_READY
+} NodeHealth;
+
+typedef struct {
+    uint8_t type;
+    uint8_t value;
+    uint8_t attempts;
+    uint32_t time_ms;
+} PendingCommand;
+
+typedef struct {
+    uint8_t id;
+    uint8_t uart;
+    uint8_t flags;
+    uint8_t mode;
+    bool seen;
+    uint32_t heartbeat_ms;
+    NodeHealth health;
+    LgParser parser;
+    PendingCommand pending;
+} SensorNode;
+
+typedef struct {
+    bool seen;
+    uint32_t time_ms;
+} RecentEvent;
+
+static SensorNode window_node = {.id = LG_NODE_A, .uart = 1, .mode = 0xFFU};
+static SensorNode door_node = {.id = LG_NODE_B, .uart = 3};
+static HubState state = FAULT;
+static bool armed;
+static bool alarm_latched;
+static bool entry_pending;
+static uint32_t entry_started_ms;
+static RecentEvent sound_event;
+static RecentEvent shock_event;
+static bool experiment;
+static uint32_t experiment_beam_events;
+static const char *const state_names[] = {
+    "DISARMED", "ARMED", "SUSPECT", "ALARM", "FAULT"
+};
+
+static void log_event(uint32_t now, const char *event, uint8_t node,
+                      uint32_t value)
+{
+    lg_log("%lu,%s,%u,%lu,%s\r\n", (unsigned long)now, event,
+           (unsigned)node, (unsigned long)value, state_names[state]);
+}
+
+static bool recent(RecentEvent event, uint32_t now, uint32_t age)
+{
+    return event.seen && now - event.time_ms <= age;
+}
+
+static void latch_alarm(uint32_t now, const char *reason, uint8_t node)
+{
+    if (!armed || alarm_latched) {
+        return;
+    }
+    alarm_latched = true;
+    state = ALARM;
+    log_event(now, reason, node, 1);
+}
+
+static void beam_onset(uint32_t now, uint16_t adc)
+{
+    if (experiment && !armed) {
+        ++experiment_beam_events;
+        log_event(now, "BEAM_TEST", LG_NODE_A, adc);
+        return;
+    }
+    latch_alarm(now, "ALARM_BEAM", LG_NODE_A);
+    log_event(now, "BEAM", LG_NODE_A, adc);
+}
+
+static void door_change(uint32_t now, bool open, uint16_t hall_adc)
+{
+    if (open && armed && !alarm_latched && !entry_pending) {
+        entry_started_ms = now;
+        entry_pending = true;
+        state = SUSPECT;
+    }
+    log_event(now, open ? "DOOR_OPEN" : "DOOR_CLOSED", LG_NODE_B, hall_adc);
+}
+
+static void disturbance(uint32_t now, bool is_sound, uint16_t value)
+{
+    if (armed && !alarm_latched) {
+        RecentEvent *current = is_sound ? &sound_event : &shock_event;
+        RecentEvent other = is_sound ? shock_event : sound_event;
+        *current = (RecentEvent){.seen = true, .time_ms = now};
+        state = SUSPECT;
+        if (recent(other, now, COMBINATION_MS)) {
+            latch_alarm(now, "ALARM_SOUND_SHOCK", LG_HUB);
+        }
+    }
+    log_event(now, is_sound ? "SOUND" : "SHOCK",
+              is_sound ? LG_NODE_A : LG_NODE_B, value);
+}
+
+static NodeHealth node_health(const SensorNode *node, uint32_t now)
+{
+    if (!node->seen || now - node->heartbeat_ms >= HEARTBEAT_TIMEOUT_MS) {
+        return !node->seen && now < HEARTBEAT_TIMEOUT_MS ? LINK_STARTING
+                                                        : LINK_LOST;
+    }
+    if (node->flags & LG_SENSOR_FAULT) {
+        return SENSOR_FAULT;
+    }
+    return (node->flags & LG_READY) ? NODE_READY : SENSOR_WAIT;
+}
+
+static void report_health(SensorNode *node, uint32_t now)
+{
+    static const char *const health_events[] = {
+        "LINK_STARTING", "LINK_LOST", "CAL_WAIT", "SENSOR_FAULT", "READY"
+    };
+    NodeHealth health = node_health(node, now);
+    if (health != node->health) {
+        node->health = health;
+        log_event(now, health_events[health], node->id, node->flags);
+    }
+    if (health != NODE_READY) {
+        latch_alarm(now, health == LINK_LOST ? "ALARM_LINK_LOST"
+                                            : "ALARM_SENSOR_UNREADY",
+                    node->id);
+    }
+}
+
+static void update_state(uint32_t now)
+{
+    report_health(&window_node, now);
+    report_health(&door_node, now);
+
+    if (entry_pending && now - entry_started_ms >= DOOR_DELAY_MS) {
+        entry_pending = false;
+        latch_alarm(now, "ALARM_DOOR_TIMEOUT", LG_NODE_B);
+    }
+    if (!recent(sound_event, now, SUSPICION_MS)) {
+        sound_event.seen = false;
+    }
+    if (!recent(shock_event, now, SUSPICION_MS)) {
+        shock_event.seen = false;
+    }
+
+    HubState next = ARMED;
+    if (alarm_latched) {
+        next = ALARM;
+    } else if (!armed) {
+        next = window_node.health == NODE_READY && door_node.health == NODE_READY
+                   ? DISARMED : FAULT;
+    } else if (entry_pending || sound_event.seen || shock_event.seen) {
+        next = SUSPECT;
+    }
+    if (next != state) {
+        state = next;
+        log_event(now, "STATE", LG_HUB, (uint32_t)state);
+    }
+}
+
+static void write_outputs(uint32_t now)
+{
+    // UNO D2 receives bit 0 and D3 receives bit 1.
+    lg_write(GPIOC, 7, state == SUSPECT || state == FAULT);
+    lg_write(GPIOB, 6, state == ALARM || state == FAULT);
+    bool blink = (now / 250U) % 2U != 0U;
+    lg_write(GPIOA, 5, state == ARMED ||
+                       (state != DISARMED && state != ARMED && blink));
+}
+
+static void disarm(uint32_t now)
+{
+    armed = false;
+    alarm_latched = false;
+    entry_pending = false;
+    sound_event.seen = false;
+    shock_event.seen = false;
+    update_state(now);
+    log_event(now, "DISARM", LG_HUB, 0);
+}
+
+static void arm(uint32_t now)
+{
+    if (armed) {
+        log_event(now, "ALREADY_ARMED", LG_HUB, 0);
+        return;
+    }
+    if (experiment || window_node.pending.type || door_node.pending.type) {
+        log_event(now, "ARM_BUSY", LG_HUB, 0);
+        return;
+    }
+    if (node_health(&window_node, now) != NODE_READY ||
+        node_health(&door_node, now) != NODE_READY) {
+        log_event(now, "ARM_NOT_READY", LG_HUB, 0);
+        return;
+    }
+    if ((window_node.flags | door_node.flags) & LG_ACTIVE) {
+        log_event(now, "ARM_PATH_NOT_CLEAR", LG_HUB, 0);
+        return;
+    }
+    armed = true;
+    state = ARMED;
+    log_event(now, "ARM", LG_HUB, 0);
+}
+
+static void acknowledge(SensorNode *node, const LgFrame *frame, uint32_t now)
+{
+    PendingCommand *pending = &node->pending;
+    if (frame->len != 3U || !pending->attempts ||
+        frame->data[0] != pending->type || frame->data[1] != pending->value) {
+        return;
+    }
+    if (pending->type == LG_CAL && frame->data[2] == 0U) {
+        // A later heartbeat confirms that calibration completed.
+        node->flags &= (uint8_t)~LG_READY;
+    } else if (pending->type == LG_MODE && frame->data[2] == 0U) {
+        // Earlier heartbeats were already drained in UART order.
+        node->mode = pending->value;
+    }
+    log_event(now, frame->data[2] == 0U ? "CMD_ACK" : "CMD_REJECT",
+              node->id, ((uint32_t)pending->type << 8) | pending->value);
+    pending->type = 0;
+    pending->attempts = 0;
+}
+
+static void receive_heartbeat(SensorNode *node, const LgFrame *frame,
+                              uint32_t now)
+{
+    if (frame->len < 2U) {
+        return;
+    }
+    bool was_active = (node->flags & LG_ACTIVE) != 0U;
+    bool active = (frame->data[1] & LG_ACTIVE) != 0U;
+    node->flags = frame->data[1];
+    node->heartbeat_ms = now;
+    node->seen = true;
+    if (node->id == LG_NODE_A && frame->len >= 3U) {
+        node->mode = frame->data[2];
+    }
+    // The periodic state catches a held obstruction/open door if an event was lost.
+    if (!was_active && active && armed) {
+        if (node->id == LG_NODE_A) {
+            beam_onset(now, 0);
+        } else {
+            door_change(now, true, 0);
+        }
+    }
+}
+
+static uint16_t optional_u16(const LgFrame *frame, uint8_t offset)
+{
+    if (frame->len < offset + 2U) {
+        return 0;
+    }
+    return (uint16_t)(frame->data[offset] |
+                     ((uint16_t)frame->data[offset + 1U] << 8));
+}
+
+static void service_node(SensorNode *node, uint32_t now)
+{
+    LgFrame frame;
+    while (lg_recv(node->uart, &node->parser, &frame)) {
+        if (frame.id != node->id) {
+            continue;
+        }
+        switch (frame.type) {
+        case LG_HEARTBEAT:
+            receive_heartbeat(node, &frame, now);
+            break;
+        case LG_ACK:
+            acknowledge(node, &frame, now);
+            break;
+        case LG_BEAM:
+            if (node->id == LG_NODE_A) {
+                node->flags |= LG_ACTIVE;
+                beam_onset(now, optional_u16(&frame, 0));
+            }
+            break;
+        case LG_SOUND:
+            if (node->id == LG_NODE_A) {
+                disturbance(now, true, optional_u16(&frame, 0));
+            }
+            break;
+        case LG_DOOR:
+            if (node->id == LG_NODE_B && frame.len && frame.data[0] <= 1U) {
+                bool open = frame.data[0] != 0U;
+                node->flags &= (uint8_t)~LG_ACTIVE;
+                if (open) {
+                    node->flags |= LG_ACTIVE;
+                }
+                door_change(now, open, optional_u16(&frame, 1));
+            }
+            break;
+        case LG_SHOCK:
+            if (node->id == LG_NODE_B) {
+                disturbance(now, false, frame.len ? frame.data[0] : 0U);
+            }
+            break;
+        default:
+            break;
+        }
+    }
+}
+
+static void queue_command(SensorNode *node, uint8_t type, uint8_t value,
+                          uint32_t now)
+{
+    node->pending = (PendingCommand){.type = type, .value = value, .time_ms = now};
+    log_event(now, "CMD", node->id, ((uint32_t)type << 8) | value);
+}
+
+static void service_command(SensorNode *node, uint32_t now)
+{
+    PendingCommand *pending = &node->pending;
+    if (!pending->type) {
+        return;
+    }
+    uint32_t elapsed = now - pending->time_ms;
+    if (elapsed >= 2U * COMMAND_TIMEOUT_MS ||
+        (pending->attempts == 2U && elapsed >= COMMAND_TIMEOUT_MS)) {
+        log_event(now, "CMD_TIMEOUT", node->id,
+                  ((uint32_t)pending->type << 8) | pending->value);
+        if (pending->type == LG_CAL && pending->attempts) {
+            node->flags &= (uint8_t)~LG_READY;
+        }
+        pending->type = 0;
+        pending->attempts = 0;
+        return;
+    }
+    if ((pending->attempts == 0U ||
+         (pending->attempts == 1U && elapsed >= COMMAND_TIMEOUT_MS)) &&
+        lg_send(node->uart, LG_HUB, pending->type, &pending->value,
+                (uint8_t)(pending->type == LG_CAL ? 0U : 1U))) {
+        ++pending->attempts;
+        pending->time_ms = now;
+    }
+}
+
+static void show_status(uint32_t now)
+{
+    log_event(now, "WINDOW_FLAGS", LG_NODE_A, window_node.flags);
+    log_event(now, "DOOR_FLAGS", LG_NODE_B, door_node.flags);
+    log_event(now, "WINDOW_MODE", LG_NODE_A, window_node.mode);
+    log_event(now, "WINDOW_FRAME_ERRORS", LG_NODE_A, window_node.parser.errors);
+    log_event(now, "DOOR_FRAME_ERRORS", LG_NODE_B, door_node.parser.errors);
+}
+
+static void execute_command(const char *line, uint32_t now)
+{
+    if (strcmp(line, "ARM") == 0) {
+        arm(now);
+    } else if (strcmp(line, "DISARM") == 0) {
+        disarm(now);
+    } else if (strcmp(line, "STATUS") == 0 || strcmp(line, "STAT") == 0) {
+        show_status(now);
+    } else if (strcmp(line, "HELP") == 0 || strcmp(line, "?") == 0) {
+        lg_log("# ARM | DISARM | STATUS | CAL | MODE 0/1/2 | LOAD 0/1\r\n");
+    } else {
+        bool calibrate = strcmp(line, "CAL") == 0;
+        bool mode = strncmp(line, "MODE ", 5) == 0 && strlen(line) == 6U &&
+                    line[5] >= '0' && line[5] <= '2';
+        bool load = strcmp(line, "LOAD 0") == 0 || strcmp(line, "LOAD 1") == 0;
+        if (!calibrate && !mode && !load) {
+            log_event(now, "BAD_COMMAND", LG_HUB, 0);
+            return;
+        }
+        if (armed || experiment || window_node.pending.type ||
+            (calibrate && door_node.pending.type)) {
+            log_event(now, "CMD_BUSY_OR_ARMED", LG_HUB, 0);
+            return;
+        }
+        queue_command(&window_node, calibrate ? LG_CAL : mode ? LG_MODE : LG_LOAD,
+                      calibrate ? 0U : (uint8_t)(line[5] - '0'), now);
+        if (calibrate) {
+            queue_command(&door_node, LG_CAL, 0, now);
+        }
+    }
+}
+
+static void service_pc(uint32_t now)
+{
+    static char line[32];
+    static uint8_t len;
+    static bool overflowed;
+    uint8_t byte;
+    while (lg_uart_read(2, &byte)) {
+        if (byte == '\r' || byte == '\n') {
+            if (overflowed) {
+                log_event(now, "COMMAND_TOO_LONG", LG_HUB, 0);
+            } else if (len != 0U) {
+                line[len] = '\0';
+                execute_command(line, now);
+            }
+            len = 0;
+            overflowed = false;
+        } else if (byte >= 32U && byte <= 126U && !overflowed) {
+            if (len == sizeof(line) - 1U) {
+                overflowed = true;
+            } else {
+                line[len++] = (char)(byte >= 'a' && byte <= 'z'
+                                         ? byte - 'a' + 'A' : byte);
+            }
+        }
+    }
+}
+
+static void service_button(uint32_t now)
+{
+    static bool was_pressed;
+    static bool debounced;
+    static uint32_t changed_ms;
+    bool pressed = !lg_read(GPIOC, 13);
+    if (pressed != was_pressed) {
+        was_pressed = pressed;
+        changed_ms = now;
+    }
+    if (pressed != debounced && now - changed_ms >= BUTTON_DEBOUNCE_MS) {
+        debounced = pressed;
+        if (debounced) {
+            if (armed) {
+                disarm(now);
+            } else {
+                arm(now);
+            }
+        }
+    }
+}
+
+static void service_experiment(uint32_t now)
+{
+    bool level = lg_read(GPIOA, 8);
+    if (level == experiment) {
+        return;
+    }
+    experiment = level;
+    if (experiment) {
+        experiment_beam_events = 0;
+        log_event(now, armed ? "TEST_STARTED_ARMED" : "TEST_STARTED", LG_HUB, 0);
+    } else {
+        log_event(now, "TEST_ENDED", LG_HUB, experiment_beam_events);
+    }
+}
+
+int main(void)
+{
+    lg_init();
+    lg_uart_init(1, 38400U);
+    lg_uart_init(2, 115200U);
+    lg_uart_init(3, 38400U);
+    lg_gpio(GPIOC, 7, LG_GPIO_OUTPUT);
+    lg_gpio(GPIOB, 6, LG_GPIO_OUTPUT);
+    lg_gpio(GPIOA, 5, LG_GPIO_OUTPUT);
+    lg_gpio(GPIOA, 8, LG_GPIO_FLOAT); // The 5 V divider provides the pull-down.
+    lg_gpio(GPIOC, 13, LG_GPIO_FLOAT); // B1 is active-low, with a board pull-up.
+    write_outputs(lg_millis());
+    lg_log("ms,event,node,value,state\r\n");
+    lg_log("# HELP lists hub commands. B1 toggles arming.\r\n");
+
+    for (;;) {
+        lg_uart_service();
+        uint32_t now = lg_millis();
+        service_experiment(now);
+        service_node(&window_node, now);
+        service_node(&door_node, now);
+        update_state(now);
+        service_button(now);
+        service_pc(now);
+        service_command(&window_node, now);
+        service_command(&door_node, now);
+        write_outputs(now);
+    }
+}
