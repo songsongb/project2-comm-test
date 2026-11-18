@@ -10,7 +10,18 @@ enum {
     DOOR_DELAY_MS = 10000,
     SUSPICION_MS = 5000,
     COMBINATION_MS = 500,
-    BUTTON_DEBOUNCE_MS = 35
+    BUTTON_DEBOUNCE_MS = 35,
+    IR_CARRIER_ARR = 1683,
+    IR_CARRIER_CCR = 561,
+    IR_PERIOD_US = 10000,
+    IR_BURST_US = 600,
+    IR_LAG_MIN_US = 100,
+    IR_LAG_MAX_US = 1200,
+    IR_WIDTH_MIN_US = 200,
+    IR_WIDTH_MAX_US = 1100,
+    IR_START_LATE_US = 100,
+    IR_READY_MATCHES = 5,
+    IR_MISSING_MS = 60
 };
 
 typedef enum {
@@ -54,6 +65,20 @@ static bool entry_pending;
 static uint32_t entry_started_ms;
 static RecentEvent sound_event;
 static RecentEvent shock_event;
+static volatile bool ir_slot_open;
+static volatile bool ir_slot_matched;
+static volatile bool ir_falling_seen;
+static volatile bool ir_valid_seen;
+static volatile bool ir_locked;
+static volatile uint16_t ir_burst_tick;
+static uint16_t ir_falling_tick;
+static volatile uint16_t ir_last_lag_us;
+static volatile uint16_t ir_last_width_us;
+static volatile uint32_t ir_last_valid_ms;
+static volatile uint32_t ir_total_matches;
+static volatile uint32_t ir_missed_slots;
+static volatile uint8_t ir_consecutive_matches;
+static bool ir_ready_reported;
 static bool experiment;
 static uint32_t experiment_beam_events;
 static const char *const state_names[] = {
@@ -80,6 +105,223 @@ static void latch_alarm(uint32_t now, const char *reason, uint8_t node)
     alarm_latched = true;
     state = ALARM;
     log_event(now, reason, node, 1);
+}
+
+static void ir_carrier_stop(void)
+{
+    /* Forced inactive drives OC1 low independently of the counter state.
+       OC1 preload remains disabled, so both mode and compare act immediately. */
+    TIM3->CCMR1 = TIM_CCMR1_OC1M_2;
+    TIM3->CCR1 = 0;
+    TIM3->CR1 = 0;
+    TIM3->CNT = 0;
+}
+
+static void ir_finish_slot(uint32_t now)
+{
+    if (!ir_slot_open) {
+        return;
+    }
+    if (ir_slot_matched) {
+        if (ir_consecutive_matches < IR_READY_MATCHES) {
+            ++ir_consecutive_matches;
+        }
+    } else {
+        ir_consecutive_matches = 0;
+        ++ir_missed_slots;
+    }
+    if (!ir_valid_seen || now - ir_last_valid_ms >= IR_MISSING_MS) {
+        ir_locked = false;
+        ir_consecutive_matches = 0;
+    }
+    if (ir_consecutive_matches >= IR_READY_MATCHES) {
+        ir_locked = true;
+    }
+}
+
+void TIM2_IRQHandler(void)
+{
+    uint32_t flags = TIM2->SR & (TIM_SR_UIF | TIM_SR_CC1IF);
+    TIM2->SR = ~flags;
+    if (flags & TIM_SR_UIF) {
+        ir_carrier_stop();
+        ir_finish_slot(lg_millis());
+        ir_slot_open = true;
+        ir_slot_matched = false;
+        ir_falling_seen = false;
+        ir_burst_tick = (uint16_t)TIM4->CNT;
+        uint32_t position = TIM2->CNT;
+        if (position < IR_START_LATE_US) {
+            /* An expired CC1 in the saved flags belongs to the preceding slot.
+               Schedule this burst's expiry from its actual start instead. */
+            TIM2->CCR1 = position + IR_BURST_US;
+            TIM3->CNT = 0;
+            TIM3->CCR1 = IR_CARRIER_CCR;
+            TIM3->CCMR1 = TIM_CCMR1_OC1M_1 | TIM_CCMR1_OC1M_2;
+            TIM3->CR1 = TIM_CR1_CEN;
+        } else {
+            /* A delayed update cannot produce a correctly timed test burst. */
+            ir_slot_open = false;
+            ir_consecutive_matches = 0;
+            ++ir_missed_slots;
+        }
+        return;
+    }
+    if (flags & TIM_SR_CC1IF) {
+        ir_carrier_stop();
+    }
+}
+
+void EXTI9_5_IRQHandler(void)
+{
+    if (!(EXTI->PR & EXTI_PR_PR7)) {
+        return;
+    }
+    EXTI->PR = EXTI_PR_PR7;
+    uint16_t tick = (uint16_t)TIM4->CNT;
+    uint16_t lag = (uint16_t)(tick - ir_burst_tick);
+    if (!lg_read(GPIOA, 7)) {
+        ir_falling_seen = ir_slot_open && !ir_slot_matched &&
+                          lag >= IR_LAG_MIN_US && lag <= IR_LAG_MAX_US;
+        if (ir_falling_seen) {
+            ir_falling_tick = tick;
+            ir_last_lag_us = lag;
+        }
+        return;
+    }
+    if (!ir_falling_seen) {
+        return;
+    }
+    ir_falling_seen = false;
+    uint16_t width = (uint16_t)(tick - ir_falling_tick);
+    ir_last_width_us = width;
+    if (ir_slot_open && !ir_slot_matched && lag < IR_PERIOD_US &&
+        width >= IR_WIDTH_MIN_US && width <= IR_WIDTH_MAX_US) {
+        uint32_t now = lg_millis();
+        if (ir_valid_seen && now - ir_last_valid_ms >= IR_MISSING_MS) {
+            ir_locked = false;
+            ir_consecutive_matches = 0;
+        }
+        ir_slot_matched = true;
+        ir_valid_seen = true;
+        ir_last_valid_ms = now;
+        ++ir_total_matches;
+    }
+}
+
+static void init_ir_guard(void)
+{
+    RCC->APB1ENR |= RCC_APB1ENR_TIM2EN | RCC_APB1ENR_TIM3EN |
+                    RCC_APB1ENR_TIM4EN;
+    (void)RCC->APB1ENR;
+    // KY-005 S -> PA6 (D12) through 330 ohms, minus -> GND, center unused.
+    lg_write(GPIOA, 6, false);
+    lg_gpio(GPIOA, 6, LG_GPIO_AF_OUTPUT);
+    // KY-022 S -> PA7 (D11), VCC -> 3.3 V, minus -> common GND.
+    lg_write(GPIOA, 7, true);
+    lg_gpio(GPIOA, 7, LG_GPIO_PULL);
+
+    TIM3->CR1 = 0;
+    TIM3->DIER = 0;
+    TIM3->PSC = 0;
+    TIM3->ARR = IR_CARRIER_ARR;
+    TIM3->CCR1 = 0;
+    TIM3->CCMR1 = TIM_CCMR1_OC1M_1 | TIM_CCMR1_OC1M_2; // PWM1, immediate CCR.
+    TIM3->CCER = TIM_CCER_CC1E;
+    TIM3->EGR = TIM_EGR_UG;
+    TIM3->SR = 0;
+    ir_carrier_stop();
+
+    TIM4->CR1 = 0;
+    TIM4->DIER = 0;
+    TIM4->PSC = LG_CPU_HZ / 1000000U - 1U;
+    TIM4->ARR = 0xFFFFU;
+    TIM4->EGR = TIM_EGR_UG;
+    TIM4->SR = 0;
+    TIM4->CNT = 0;
+    TIM4->CR1 = TIM_CR1_CEN;
+
+    AFIO->EXTICR[1] &= ~AFIO_EXTICR2_EXTI7; // EXTI7 -> port A.
+    EXTI->RTSR |= EXTI_RTSR_TR7;
+    EXTI->FTSR |= EXTI_FTSR_TR7;
+    EXTI->PR = EXTI_PR_PR7;
+    EXTI->IMR |= EXTI_IMR_MR7;
+    NVIC_ClearPendingIRQ(EXTI9_5_IRQn);
+    /* Equal preemption priorities serialize receive state and slot changes. */
+    NVIC_SetPriority(EXTI9_5_IRQn, 2);
+    NVIC_EnableIRQ(EXTI9_5_IRQn);
+
+    TIM2->CR1 = 0;
+    TIM2->DIER = 0;
+    TIM2->PSC = LG_CPU_HZ / 1000000U - 1U;
+    TIM2->ARR = IR_PERIOD_US - 1U;
+    TIM2->CCR1 = IR_BURST_US;
+    TIM2->EGR = TIM_EGR_UG;
+    TIM2->SR = 0;
+    TIM2->CNT = 0;
+    NVIC_ClearPendingIRQ(TIM2_IRQn);
+    NVIC_SetPriority(TIM2_IRQn, 2);
+    NVIC_EnableIRQ(TIM2_IRQn);
+    TIM2->DIER = TIM_DIER_UIE | TIM_DIER_CC1IE;
+    TIM2->CR1 = TIM_CR1_CEN;
+}
+
+static bool ir_ready(void)
+{
+    uint32_t primask = __get_PRIMASK();
+    __disable_irq();
+    uint32_t now = lg_millis();
+    if (!ir_valid_seen || now - ir_last_valid_ms >= IR_MISSING_MS) {
+        ir_locked = false;
+        ir_consecutive_matches = 0;
+    }
+    bool ready = ir_locked && ir_valid_seen &&
+                 now - ir_last_valid_ms < IR_MISSING_MS;
+    __set_PRIMASK(primask);
+    return ready;
+}
+
+static void service_ir_guard(uint32_t now)
+{
+    bool ready = ir_ready();
+    if (ready != ir_ready_reported) {
+        ir_ready_reported = ready;
+        if (!ready) {
+            latch_alarm(now, "ALARM_IR_BEAM", LG_HUB);
+        }
+        log_event(now, ready ? "IR_READY" : "IR_LOST", LG_HUB,
+                  ir_total_matches);
+    }
+    if (armed && !ready) {
+        latch_alarm(now, "ALARM_IR_BEAM", LG_HUB);
+    }
+}
+
+static void show_ir_status(uint32_t now)
+{
+    uint32_t primask = __get_PRIMASK();
+    __disable_irq();
+    now = lg_millis();
+    bool raw = lg_read(GPIOA, 7);
+    uint32_t age = ir_valid_seen ? now - ir_last_valid_ms : UINT32_MAX;
+    bool ready = ir_locked && ir_valid_seen && age < IR_MISSING_MS;
+    uint8_t matches = ir_consecutive_matches;
+    uint32_t total = ir_total_matches;
+    uint32_t missed = ir_missed_slots;
+    uint16_t lag = ir_last_lag_us;
+    uint16_t width = ir_last_width_us;
+    __set_PRIMASK(primask);
+    log_event(now, "IR_RX_RAW", LG_HUB, raw ? 1U : 0U);
+    log_event(now, "IR_READY_STATE", LG_HUB, ready ? 1U : 0U);
+    log_event(now, "IR_LAST_VALID_AGE_MS", LG_HUB, age);
+    log_event(now, "IR_MATCH_COUNT", LG_HUB, matches);
+    log_event(now, "IR_TOTAL_MATCHES", LG_HUB, total);
+    log_event(now, "IR_MISSED_SLOTS", LG_HUB, missed);
+    log_event(now, "IR_PULSE_LAG_US", LG_HUB, lag);
+    log_event(now, "IR_PULSE_WIDTH_US", LG_HUB, width);
+    log_event(now, "IR_CARRIER_HZ", LG_HUB,
+              LG_CPU_HZ / (IR_CARRIER_ARR + 1U));
+    log_event(now, "IR_BURST_US", LG_HUB, IR_BURST_US);
 }
 
 static void beam_onset(uint32_t now, uint16_t adc)
@@ -216,6 +458,10 @@ static void arm(uint32_t now)
     }
     if ((window_node.flags | door_node.flags) & LG_ACTIVE) {
         log_event(now, "ARM_PATH_NOT_CLEAR", LG_HUB, 0);
+        return;
+    }
+    if (!ir_ready()) {
+        log_event(now, "ARM_IR_NOT_READY", LG_HUB, 0);
         return;
     }
     armed = true;
@@ -363,6 +609,7 @@ static void show_status(uint32_t now)
     log_event(now, "WINDOW_MODE", LG_NODE_A, window_node.mode);
     log_event(now, "WINDOW_FRAME_ERRORS", LG_NODE_A, window_node.parser.errors);
     log_event(now, "DOOR_FRAME_ERRORS", LG_NODE_B, door_node.parser.errors);
+    show_ir_status(now);
 }
 
 static void execute_command(const char *line, uint32_t now)
@@ -373,8 +620,11 @@ static void execute_command(const char *line, uint32_t now)
         disarm(now);
     } else if (strcmp(line, "STATUS") == 0 || strcmp(line, "STAT") == 0) {
         show_status(now);
+    } else if (strcmp(line, "IRSTATUS") == 0) {
+        show_ir_status(now);
     } else if (strcmp(line, "HELP") == 0 || strcmp(line, "?") == 0) {
         lg_log("# ARM | DISARM | STATUS | CAL | MODE 0/1/2 | LOAD 0/1\r\n");
+        lg_log("# IRSTATUS shows the 38 kHz IR guard state and pulse timing.\r\n");
     } else {
         bool calibrate = strcmp(line, "CAL") == 0;
         bool mode = strncmp(line, "MODE ", 5) == 0 && strlen(line) == 6U &&
@@ -472,6 +722,7 @@ int main(void)
     lg_gpio(GPIOA, 5, LG_GPIO_OUTPUT);
     lg_gpio(GPIOA, 8, LG_GPIO_FLOAT); // The 5 V divider provides the pull-down.
     lg_gpio(GPIOC, 13, LG_GPIO_FLOAT); // B1 is active-low, with a board pull-up.
+    init_ir_guard();
     write_outputs(lg_millis());
     lg_log("ms,event,node,value,state\r\n");
     lg_log("# HELP lists hub commands. B1 toggles arming.\r\n");
@@ -480,6 +731,7 @@ int main(void)
         lg_uart_service();
         uint32_t now = lg_millis();
         service_experiment(now);
+        service_ir_guard(now);
         service_node(&window_node, now);
         service_node(&door_node, now);
         update_state(now);
