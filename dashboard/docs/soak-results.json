@@ -1,0 +1,24 @@
+{
+  "kind": "synthetic accelerated soak; no real hardware",
+  "stages": [
+    {
+      "records_processed": 20000,
+      "python_heap_mib": 14.341958045959473,
+      "python_peak_mib": 14.616056442260742,
+      "metric_buffer": 7200,
+      "raw_buffer": 2000,
+      "anomaly_keys": 0
+    },
+    {
+      "records_processed": 40000,
+      "python_heap_mib": 14.337867736816406,
+      "python_peak_mib": 14.629450798034668,
+      "metric_buffer": 7200,
+      "raw_buffer": 2000,
+      "anomaly_keys": 0
+    }
+  ],
+  "elapsed_s": 129.18942824203987,
+  "peak_rss_mib": 52.4921875,
+  "stored_raw_records": 40000
+}

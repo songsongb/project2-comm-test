@@ -1,4 +1,5 @@
 import uuid
+from collections import OrderedDict
 from .models import utc_now
 
 EVENTS = {"SENSOR_FAULT", "CAL_WAIT", "ARM_NOT_READY", "LINK_LOST", "CMD_TIMEOUT",
@@ -8,8 +9,8 @@ EVENTS = {"SENSOR_FAULT", "CAL_WAIT", "ARM_NOT_READY", "LINK_LOST", "CMD_TIMEOUT
 class AnomalyDetector:
     def __init__(self, cooldown=30):
         self.cooldown = cooldown
-        self.last_alert = {}
-        self.frame_errors = {}
+        self.last_alert = OrderedDict()
+        self.frame_errors = OrderedDict()
 
     def check(self, record, metric=None):
         codes = []
@@ -24,6 +25,8 @@ class AnomalyDetector:
                 if previous is not None and d["value"] > previous:
                     codes.append("FRAME_ERRORS_INCREASE")
                 self.frame_errors[key] = d["value"]
+                if len(self.frame_errors) > 128:
+                    self.frame_errors.popitem(last=False)
         if record.kind == "STAT":
             if not d["ready"]:
                 codes.append("WINDOW_NOT_READY")
@@ -44,13 +47,18 @@ class AnomalyDetector:
                 codes.append("TRIAL_MISS")
         alerts = []
         for code in codes:
-            node = d.get("node", record.device)
+            node_raw = d.get("node", record.device)
+            node = str(node_raw)
             key = (record.source, record.device, record.session, node, code)
             if record.ingested_at - self.last_alert.get(key, -float("inf")) < self.cooldown:
                 continue
             self.last_alert[key] = record.ingested_at
+            self.last_alert.move_to_end(key)
+            if len(self.last_alert) > 512:
+                self.last_alert.popitem(last=False)
             alerts.append({"id": uuid.uuid4().hex, "code": code, "device": record.device,
-                           "node": node, "source": record.source, "session": record.session,
+                           "node": node, "node_id": node_raw if isinstance(node_raw, int) else None,
+                           "source": record.source, "session": record.session,
                            "received_at": record.received_at, "detected_at": utc_now(),
                            "status": "detected", "evidence_ids": [record.id],
                            "rule": "규칙 기반 관측; 하드웨어 원인 미확정"})

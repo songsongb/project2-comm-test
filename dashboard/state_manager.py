@@ -56,6 +56,7 @@ class TraceCapture:
 class StateManager:
     def __init__(self, storage):
         self.storage = storage
+        self.identity = uuid.uuid4().hex
         self.lock = threading.RLock()
         self.metrics = Metrics()
         self.sessions = {d: 0 for d in DEVICES}
@@ -73,6 +74,10 @@ class StateManager:
         self.plots = deque(maxlen=3000)
         self.trials = deque(maxlen=1000)
         self.events = deque(maxlen=500)
+        self.security_events = deque(maxlen=120)
+        self.node_health = {}
+        self.uno_event = None
+        self.revisions = {k: 0 for k in ("metrics", "sensors", "events", "records")}
         self.traces = deque(maxlen=15)
         self.active_trace = None
         self.trace_status = None
@@ -100,6 +105,7 @@ class StateManager:
             self.status, self.hub_state, self.experiment_active = None, None, None
             self.status_parts.clear()
             self.pending_nodes.clear()
+            self.node_health.clear()
         if device == "window" and self.active_trace:
             self.active_trace.status, self.active_trace.reason = "aborted", "device_restart"
             self.storage.save("trace", self.active_trace.as_dict())
@@ -117,13 +123,17 @@ class StateManager:
                 self.clocks[record.device] = record.mcu_ms
             self.last[record.device] = record
             self.records.append(record)
+            self.revisions["records"] += 1
             if record.kind in ("STAT", "HALL", "HUB"):
                 self.latest[record.device] = record
             if record.kind == "STAT":
+                self.revisions["metrics"] += 1
                 row = self.metrics.add(record)
                 self.metric_rows.append(row)
                 if self.experiment:
                     self.experiment.add(row)
+                    if len(self.experiment.rows) >= 7200:
+                        self.stop_experiment()  # Bound RAM; raw data continue in SQLite.
             elif record.kind == "PLOT":
                 self.plots.append({**record.data, "source": record.source, "session": record.session,
                                    "received_at": record.received_at})
@@ -133,6 +143,13 @@ class StateManager:
             elif record.kind == "HUB":
                 self._hub(record)
                 self.events.append(record.as_dict())
+                if record.data["event"] not in {"WINDOW_FLAGS", "DOOR_FLAGS", "WINDOW_MODE", "WINDOW_FRAME_ERRORS", "DOOR_FRAME_ERRORS"}:
+                    self.security_events.append(record.as_dict())
+                    self.revisions["events"] += 1
+            elif record.kind == "UNO_EVENT":
+                self.uno_event = record.as_dict()
+            if record.kind in ("PLOT", "TRIAL") or record.kind.startswith("TRACE_"):
+                self.revisions["sensors"] += 1
             if record.kind == "TRACE_BEGIN":
                 if self.active_trace:
                     self.active_trace.status, self.active_trace.reason = "incomplete", "새 BEGIN으로 중단"
@@ -156,6 +173,8 @@ class StateManager:
             self.safety_epoch += 1
         self.hub_state = {"state": d["state"], "at": r.ingested_at, "source": r.source}
         event = d["event"]
+        if event in {"READY", "LINK_LOST", "CAL_WAIT", "SENSOR_FAULT", "LINK_STARTING"}:
+            self.node_health[str(d["node"])] = {"event": event, "at": r.ingested_at, "received_at": r.received_at}
         if event == "CMD":
             self.pending_nodes.add(d["node"])
             self.safety_epoch += 1
@@ -195,7 +214,7 @@ class StateManager:
                 self.storage.save("experiment", self.experiment.as_dict())
                 self.experiment = None
 
-    def snapshot(self, now=None):
+    def snapshot(self, now=None, view="all", details=False):
         now = time.time() if now is None else now
         with self.lock:
             devices = {}
@@ -211,6 +230,21 @@ class StateManager:
                                    "session": self.sessions[device],
                                    "latest": latest.as_dict() if latest and now - latest.ingested_at <= FRESH_SECONDS and (latest.source != "live" or self.connection[device]["connected"]) else None}
             state = self.hub_state["state"] if self.hub_state and devices["hub"]["fresh"] and now - self.hub_state["at"] <= FRESH_SECONDS else "Unknown"
+            if view != "all":
+                # Metric/plot rows are immutable after ingest. Copy their references
+                # instead of deep-copying every retained record under the reader lock.
+                result = deepcopy({"devices": devices, "hub_state": state, "status": self.status,
+                                   "node_health": self.node_health, "uno_event": self.uno_event,
+                                   "revisions": self.revisions, "events": list(self.security_events),
+                                   "experiment": None if not self.experiment else {
+                                       k: getattr(self.experiment, k) for k in ("id", "source", "started_at", "mode", "load", "port", "session")}})
+                result["records"] = []
+                if view == "dma":
+                    result["metrics"] = list(self.metric_rows)
+                if details:
+                    result.update(plots=list(self.plots)[-600:], trials=list(self.trials),
+                                  traces=[t.as_dict() for t in self.traces], trace_status=deepcopy(self.trace_status))
+                return result
             return deepcopy({"devices": devices, "hub_state": state, "status": self.status,
                              "metrics": list(self.metric_rows), "plots": list(self.plots),
                              "trials": list(self.trials), "events": list(self.events),

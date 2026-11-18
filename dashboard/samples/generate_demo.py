@@ -47,6 +47,25 @@ def generate():
         t += 3
     emit(t, "window", "TRACE_END,1997,4")
     emit(t + 3, "window", "TRACE_ABORT,timeout")
+    # Security walkthrough: all names are real Hub events, values remain synthetic.
+    # These logs represent manual/physical actions, never Dashboard commands.
+    stages = [
+        ('READY', 1, 1, 'DISARMED'), ('READY', 2, 1, 'DISARMED'),
+        ('ARM', 3, 0, 'ARMED'), ('DOOR_OPEN', 2, 2300, 'SUSPECT'),
+        ('SHOCK', 2, 3, 'SUSPECT'), ('ALARM_SOUND_SHOCK', 3, 1, 'ALARM'),
+        ('SOUND', 1, 80, 'ALARM'), ('BEAM', 1, 500, 'ALARM'),
+        ('DOOR_CLOSED', 2, 2000, 'ALARM'), ('DISARM', 3, 0, 'DISARMED'),
+        ('ARM', 3, 0, 'ARMED'), ('ALARM_BEAM', 1, 1, 'ALARM'),
+        ('BEAM', 1, 500, 'ALARM'), ('DISARM', 3, 0, 'DISARMED'),
+        ('LINK_LOST', 2, 1, 'FAULT'), ('SENSOR_FAULT', 1, 4, 'FAULT'),
+    ]
+    for i, (event, node, value, state) in enumerate(stages):
+        ms = t + 1000 + i * 1500
+        emit(ms, 'hub', f'{ms},{event},{node},{value},{state}')
+        window_flags = 4 if event == 'SENSOR_FAULT' else 1
+        door_flags = 3 if event == 'DOOR_OPEN' else 1
+        for name, target, val in (('WINDOW_FLAGS', 1, window_flags), ('DOOR_FLAGS', 2, door_flags), ('WINDOW_MODE', 1, 2), ('WINDOW_FRAME_ERRORS', 1, 0), ('DOOR_FRAME_ERRORS', 2, 0)):
+            emit(ms, 'hub', f'{ms},{name},{target},{val},{state}')
     return sorted(rows, key=lambda r: r["received_at"])
 
 

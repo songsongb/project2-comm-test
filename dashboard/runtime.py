@@ -1,8 +1,7 @@
-"""Process-lifetime services, independent of Streamlit reruns and LLM latency."""
+"""Process-lifetime collection and rules, independent of UI refresh."""
 from collections import deque
 import csv
 import io
-import json
 import os
 from pathlib import Path
 import queue
@@ -11,8 +10,6 @@ import time
 from .anomaly_detector import AnomalyDetector
 from .command_controller import CommandController
 from .config import DATA_DIR
-from .diagnosis_manager import DiagnosisManager
-from .metrics import summarize
 from .protocol_parser import parse
 from .serial_manager import SerialManager
 from .state_manager import StateManager
@@ -31,7 +28,7 @@ def csv_bytes(rows):
 
 
 class Runtime:
-    def __init__(self, data_dir=None, client=None):
+    def __init__(self, data_dir=None):
         self.data_dir = Path(data_dir or os.environ.get("DASHBOARD_DATA_DIR", DATA_DIR))
         self.data_dir.mkdir(parents=True, exist_ok=True)
         self.storage = Storage(self.data_dir / "dashboard.sqlite3")
@@ -39,12 +36,11 @@ class Runtime:
         self.serial = SerialManager(self.receive, self.state.set_connection)
         self.controller = CommandController(self.state, self.serial, self.storage)
         self.detector = AnomalyDetector()
-        self.diagnosis = DiagnosisManager(self.storage, client)
         self.queue = queue.Queue(maxsize=20000)
         self.lock = threading.RLock()
         self.mode = "live"
+        self.controller.source_mode = lambda: self.mode
         self.replay = None
-        self.auto_diagnose = False
         self.queue_drops = 0
         self.error = None
         self.stop = threading.Event()
@@ -67,11 +63,6 @@ class Runtime:
             for alert in alerts:
                 self.anomalies.append(alert)
                 self.storage.save("anomaly", alert)
-                if self.auto_diagnose:
-                    try:
-                        self.request_diagnosis(alert)
-                    except ValueError as exc:
-                        self.error = str(exc)
             self.controller.on_record(record)
 
     def _run(self):
@@ -111,29 +102,10 @@ class Runtime:
             self.state = StateManager(self.storage)
             self.serial.status = self.state.set_connection
             self.controller = CommandController(self.state, self.serial, self.storage)
+            self.controller.source_mode = lambda: self.mode
             self.detector = AnomalyDetector()
             self.anomalies.clear()
             self.mode = mode
-
-    def evidence(self, required_ids=()):
-        with self.state.lock:
-            records = list(self.state.records)
-            rows = list(self.state.metric_rows)
-        selected = [r for r in records if r.id in required_ids]
-        selected += [r for r in records[-50:] if r not in selected and r.kind not in ("RAW", "HEADER", "TRACE_DATA")]
-        evidence = [{"id": r.id, "device": r.device, "source": r.source,
-                     "fields": {**r.data, "kind": r.kind, "session": r.session,
-                                "pc_received_at": r.received_at, "raw": r.raw}}
-                    for r in selected]
-        for i, row in enumerate(summarize(rows)):
-            evidence.append({"id": f"summary-{i}", "device": "window", "source": row["source"], "fields": row})
-        return evidence
-
-    def request_diagnosis(self, anomaly):
-        evidence = self.evidence(anomaly["evidence_ids"])
-        if not any(e["id"] in anomaly["evidence_ids"] for e in evidence):
-            raise ValueError("근거가 메모리 보존 범위를 벗어났습니다. 저장 이력을 확인하세요")
-        return self.diagnosis.submit(anomaly["code"], evidence, anomaly_id=anomaly["id"])
 
     def close(self):
         if self.closed:
@@ -145,7 +117,4 @@ class Runtime:
         self.queue.join()
         self.stop.set()
         self.thread.join(timeout=2)
-        self.diagnosis.close()
-        # Keep SQLite open if an in-flight diagnosis still needs to persist its result.
-        if not self.diagnosis.thread.is_alive():
-            self.storage.close()
+        self.storage.close()

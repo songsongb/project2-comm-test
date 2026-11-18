@@ -1,0 +1,42 @@
+{
+  "STM1번 코드.txt": {
+    "before": "4442912c727604ba75d4a5faeb952bad51b599f7fbfc62edafda8ced8bd94f8c",
+    "after": "4442912c727604ba75d4a5faeb952bad51b599f7fbfc62edafda8ced8bd94f8c"
+  },
+  "STM2번 코드.txt": {
+    "before": "15e4d9c1014aaea524eaaf67bdfa71ec79017a88dff7021b7285de684929cbff",
+    "after": "15e4d9c1014aaea524eaaf67bdfa71ec79017a88dff7021b7285de684929cbff"
+  },
+  "STM3번코드.txt": {
+    "before": "c8683582693c803aa23331f915e54e58e66f1a821f7719767e841b0be1296818",
+    "after": "c8683582693c803aa23331f915e54e58e66f1a821f7719767e841b0be1296818"
+  },
+  "플잭2우노 4번 코드.txt": {
+    "before": "02278c8ef518675bfd6ab1a49f9fe957afcf4fb06a444bfd6f7a8a4026e4b70a",
+    "after": "02278c8ef518675bfd6ab1a49f9fe957afcf4fb06a444bfd6f7a8a4026e4b70a"
+  },
+  "laser_guard.c": {
+    "before": "4a77ef4adcb8c3615d9f706b393df40c9847e0a2b991ba1a742242a177b3e3dc",
+    "after": "4a77ef4adcb8c3615d9f706b393df40c9847e0a2b991ba1a742242a177b3e3dc"
+  },
+  "laser_guard.h": {
+    "before": "5961730f06011f778a5901dc14f7996570798b9a6224d3ae3ad4c00aa0911132",
+    "after": "5961730f06011f778a5901dc14f7996570798b9a6224d3ae3ad4c00aa0911132"
+  },
+  "dashboard/metrics.py": {
+    "before": "5d7c9791b0a684076e599db7961c952986b07cdbd4790d47e897ea1a5e861c09",
+    "after": "5d7c9791b0a684076e599db7961c952986b07cdbd4790d47e897ea1a5e861c09"
+  },
+  "dashboard/protocol_parser.py": {
+    "before": "02118aa6dc50780fbe288748f576724f32898d0af027d383791c299b48985b9c",
+    "after": "02118aa6dc50780fbe288748f576724f32898d0af027d383791c299b48985b9c"
+  },
+  "dashboard/serial_manager.py": {
+    "before": "917a21f9294bdb852f993394339c0ceeb20454f73cb925c6da59e38198d09394",
+    "after": "917a21f9294bdb852f993394339c0ceeb20454f73cb925c6da59e38198d09394"
+  },
+  "dashboard/data/dashboard.sqlite3": {
+    "before": "57da3a0c4853f73f5f8b7adf7d7f36c4cd19a26030e85f41c3671c160b3f5291",
+    "after": "57da3a0c4853f73f5f8b7adf7d7f36c4cd19a26030e85f41c3671c160b3f5291"
+  }
+}

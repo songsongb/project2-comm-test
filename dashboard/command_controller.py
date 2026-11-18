@@ -1,4 +1,4 @@
-"""No model text reaches UART. Approvals are single use, expire, and bind state."""
+"""Fixed manual commands. Approvals are single use, expire, and bind state."""
 import threading
 import time
 import uuid
@@ -20,11 +20,14 @@ class CommandController:
         self.proposals = {}
         self.current = None
         self.last_query = -float("inf")
+        self.source_mode = lambda: "live"
 
     def check(self, command, ctx=None, idle_confirmed=False, baseline_confirmed=False):
         ctx = ctx or self.state.control_context()
         if command not in ALLOWED:
             return False, "허용 목록에 없는 명령"
+        if self.source_mode() != "live":
+            return False, "Demo/Replay 하드웨어 제어 차단"
         if not ctx["connected"]:
             return False, "허브 연결 없음"
         if command in ("STATUS", "HELP"):
@@ -64,6 +67,12 @@ class CommandController:
                  "idle_confirmed": idle_confirmed, "baseline_confirmed": baseline_confirmed,
                  "before": ctx, "acks": {}, "result": "미실행"}
             self.proposals[p["id"]] = p
+            while len(self.proposals) > 64:
+                oldest = next(iter(self.proposals))
+                if self.current and oldest == self.current["id"]:
+                    self.proposals[oldest] = self.proposals.pop(oldest)
+                else:
+                    self.proposals.pop(oldest)
             self.storage.save("command", p)
             return dict(p)
 

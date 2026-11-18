@@ -1,0 +1,22 @@
+{
+  "root": "/tmp/laser-guard-baseline",
+  "runs_per_mode": 3,
+  "metric_rows": 7200,
+  "db_records": 10229,
+  "render": {
+    "legacy-five-tabs": {
+      "median_render_ms": 1266.258017043583,
+      "min_ms": 1222.2694579977542,
+      "max_ms": 1403.0037040356547,
+      "charts": 7
+    }
+  },
+  "raw_query_calls": 5,
+  "raw_rows_decoded_for_ui": 50000,
+  "peak_rss_mib": 268.3671875,
+  "threads": [
+    "MainThread",
+    "ollama-diagnosis",
+    "log-processing"
+  ]
+}

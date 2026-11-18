@@ -1,52 +1,58 @@
-# 변경 내역과 요구사항 대응
+# UI Lite 변경 내역
 
-신규 `dashboard/` 디렉터리만 추가했습니다. 기존 tracked 파일은 수정하지 않았으며 사용자 제공 펌웨어 6개는 미추적 상태를 유지합니다. 작업 브랜치 `feature/dashboard-llm`을 `feature/comm-smoke-test`의 `021eed5`에서 생성했습니다. 커밋·push·MCU 업로드는 수행하지 않았습니다.
+기준은 `feature/dashboard-llm`의 `5de4508`이며 새 브랜치는 `feature/dashboard-ui-lite`입니다. 작업 시작 시 tracked/untracked 변경사항은 없었습니다. 변경은 PC Dashboard 디렉터리로 제한했습니다. 원본 6개 펌웨어, metrics.py, protocol_parser.py, serial_manager.py, 기존 SQLite 파일은 작업 전후 SHA-256으로 보존을 확인합니다. 구버전 Smoke Test는 수정하지 않았습니다.
 
-## 단계별 구현
+## 변경 파일
 
-| 단계 | 결과 |
+| 경로 | 변경 목적 |
 |---|---|
-| Phase 1 | 포트 자동 열거/수동 역할 선택, 다중 수신, 장치별 파서, 상태/최신성, SQLite 원본, JSONL 재생, 자동 재연결 |
-| Phase 2 | 실제 STAT 17개 숫자 필드, MCU interval 처리량, 관측 누락, 취득 IRQ, 사이클/시간 비율, MODE/LOAD별 통계, 안정화/경계 제외, 실험 저장/CSV |
-| Sensor | PLOT 수동 계측 명령/5Hz 그래프, mic RMS·기준·임계값, TRACE markers/빈 구간/END 검증, 유효 TRIAL 성공률과 조건별 집계 |
-| Phase 3 | 규칙 탐지, 쿨다운, 선택/자동 진단, 로컬 Ollama JSON Schema, evidence ID/값/명령 검증, 모델/timeout, 중복 방지·별도 스레드, 자연어 질문·이력 |
-| Phase 4 | 8개 고정 허용 명령(읽기 2개/변경 6개), DISARMED/최신 상태 검사, CAL 환경 확인, 단일 승인, 전송 직전 재검사, ACK 매칭·후속 계측 검증·감사 이력 |
-| Phase 5 | 파서·성능·세션·재생·가상 다중 포트·재연결·Ollama 실패/timeout·거부/무승인/중복·CAL 양노드·AppTest·Linux 실제 PySerial PTY 검증 |
+| app.py | 상단 보안 관제/DMA 전환, 3초 기본 갱신, 현재 화면만 실행, stateful lazy 패널, 명시적 다운로드 |
+| pages/overview.py | 상태 대시보드·4개 노드 카드·역사 이벤트·수동 신고 지원 |
+| pages/dma_performance.py | 핵심 4그래프·6조건 표·출처/포트/세션 선택·캐시·실험 메타데이터 조회 |
+| pages/sensor_experiment.py | 열 때만 PLOT/TRACE/TRIAL 생성, 최근 PLOT extrema 표시, null/TRACE 전체 보존 |
+| pages/recovery_control.py | 수동 승인만 유지, 과거 LLM 제안/연동 제거, typed table |
+| runtime.py | LLM 객체·스레드·큐·요청·종료 경로 삭제; 시리얼/처리 스레드·규칙 보존 |
+| state_manager.py | 화면별 얕은 스냅샷·revision/identity, 별도 보안 이벤트 버퍼, 장기 실험 자동 저장 상한 |
+| anomaly_detector.py | node 문자열과 원본 numeric node_id 분리; 쿨다운 인덱스 상한 |
+| command_controller.py | 기존 승인/전후 검사 유지, Demo/Replay Controller 차단, 제안 캐시 상한 |
+| storage.py | 기존 스키마/내용 보존; 필터된 JSONL 명시적 조회, 실험 메타데이터·단건 조회 |
+| presentation.py | 공통 Arrow 타입 정규화·bounded render cache·scope 필터·표시용 extrema |
+| ui_components.py | responsive CSS·lazy expander·사용자 클릭 클립보드 복사 |
+| emergency.py | 관측/사용자 입력 분리 요약·로컬 수동 신고 진술 기록; 외부 통신 없음 |
+| requirements.txt / requirements-dev.txt | 실행용과 Pytest 개발용 분리; LLM 실행 의존성 없음 |
+| samples/generate_demo.py / synthetic_demo.jsonl | 실제 firmware 이벤트 종류로 합성 보안 상태 시나리오 추가; 기존 6조건 값/TRACE 보존 |
+| tests/test_app.py / test_ui_lite.py | 두 화면·lazy 동작·혼합 타입·연결 재사용·기록 보존·신고 안전성 검증 |
+| scripts/benchmark_ui.py / soak_runtime.py / browser_check.py | 재현 가능한 선택적 성능·가속 스트레스·실제 Chromium QA |
+| README.md / docs/ | 현재 사용법·실측 테스트 출력·측정 조건·브라우저 캡처 |
 
-MODE 0/1/2, LOAD 0/1, CAL은 변경 명령 6개입니다. STATUS/HELP를 제외한 arbitrary write API는 UI/LLM에 노출하지 않습니다. 수동 Window PLOT/PLOTOFF/TRACE는 별도의 고정 계측 명령이며 레이저/릴레이 동작이 아닙니다.
+삭제: `llm_client.py`, `diagnosis_manager.py`, `pages/ai_diagnostics.py`, `tests/test_llm_anomalies.py`. 과거 diagnosis artifacts 및 이를 근거로 한 기존 command artifacts는 DB에서 삭제하지 않았고 UI에서 숨깁니다. Ollama 서비스/모델 설치·실행·삭제를 수행하지 않았습니다. 기준 버전 벤치마크에서는 과거 코드의 idle 진단 스레드만 생성되며 실제 LLM 호출은 없었습니다.
 
-## 데이터와 실행 경로
+## 선택적 실행 경로
 
 ```text
-USB port worker × N → bounded PC record queue → parser → state / metrics / SQLite
-                                                    → anomaly rules → diagnosis queue → Ollama
+USB worker × N → bounded queue → parser → state / unchanged metrics / SQLite
+                                        → bounded rule anomaly observations
 
-Streamlit rerun/fragment → singleton Runtime snapshot → five tabs
-LLM actions enum → proposal → state/physical confirmations → explicit approval
-                 → port writer queue → state recheck → fixed UART bytes
-                 → matched hub result → fresh STATUS + sensor logs → audit record
+Streamlit singleton Runtime
+  ├─ Security: latest device snapshot + bounded historical security timeline
+  └─ DMA Lab: original valid metrics → selected source/port/session → 4 cached figures
+      ├─ sensor panel opened → recent PLOT / complete TRACE / valid TRIAL
+      ├─ experiment panel opened → metadata → explicit selected result
+      └─ control panel opened → manual approval → write-time checks → ACK + followup
+
+Emergency preparation → copy / optional user-declared LOCAL record (no dispatch)
+Raw export preparation button → bounded, source-filtered SQLite read → download
 ```
 
-PC 수신 시각은 UTC timezone-aware ISO 문자열, MCU ms는 장치별 독립 uint32입니다. BOOT/클록 역행을 감지하면 해당 장치 세션을 구분합니다. uint32 wrap과 지연 TRIAL은 재부팅과 구별합니다. 알림/진단에는 source를 넣고 실측과 합성을 통계에서도 분리합니다.
+그래프 통계 계산은 metrics.py의 기존 결과를 사용합니다. `presentation.comparison()`은 자료 범위만 나눈 뒤 원본을 `summarize()`에 넘기며, 누락/과도 구간 제외 기준은 변경하지 않았습니다. UI table은 식별/중첩 필드를 string, 명시한 계측 컬럼을 nullable numeric, boolean을 nullable boolean으로 변환합니다. Arrow 경고를 감추는 방식이 아닙니다.
 
-보존 버퍼는 원본 2000행, STAT 7200구간, PLOT 3000개, TRIAL 1000개, 이벤트 500개, TRACE 15개입니다. 전체 원본은 SQLite, 실험/진단/완료 TRACE/명령은 artifact로 지속 저장합니다. 전체 원본 streaming export CLI도 제공합니다. 디스크 자동 회전은 아직 없으며 장기 실행 후 백업이 필요합니다.
+UI 모드 전환 시 Runtime/state/SerialManager/worker가 재생성되지 않습니다. 입력 소스 변경은 기존과 같이 producer를 종료하고 메모리만 초기화합니다. 고유 state identity가 캐시·다운로드를 소스 변경 사이에서 분리합니다. 버전별 render cache는 최대 8항목이며 이전 revision이 무한히 쌓이지 않습니다.
 
-## 최종 질문에 대한 답
+## 남은 한계
 
-- **MCU 수정 없이 어디까지?** 최신 4보드 텍스트 로그 수집·재생, DMA 비교·실험, 센서/TRACE/TRIAL, Hub 상태·오류 규칙, LLM 가설 및 승인 명령·후속 검증을 PC에서 구현했습니다. MCU 재빌드·업로드는 필요 없습니다.
-- **실제 측정 DMA 지표?** 현재 실측 로그가 제공되지 않아 실측 수치는 없습니다. 연결하면 pairs/skipped/acq_cycles/acq_permille/acq_irqs/mode/load/ready와 원본 필드를 수집합니다. 샘플 JSONL 값은 전부 합성입니다.
-- **추가 계측?** UART ORE/FE/NE, DMA overrun/TE 원인별 카운터, 전체 CPU 사용률, 검출 지연, 실제 광학 pulse, 구간 elapsed/seq, HB age·pending·experiment 등. 구체적인 제안은 [분석 문서](firmware_analysis.md)에 있습니다.
-- **LLM 진단?** 관측된 센서/보정/링크/명령/수집/프레임 오류/경보/실험 문제의 가능한 원인과 점검 절차입니다. 단일 SENSOR_FAULT로 ADC DMA 고장을 확정하지 않습니다. 입력 근거와 구조 검증이 실패하면 결과를 표시 가능한 사실로 승격하지 않습니다.
-- **실행 가능한 복구?** 실제 Hub 연결 및 최신 DISARMED·두 센서 READY·유휴 확인 하에 MODE 0/1/2, LOAD 0/1, CAL. CAL은 물리 환경 확인 및 양노드 후속 로그 필요. 실제 하드웨어 명령 수행 자체는 미검증입니다. MCU가 전제 조건에 따라 거부할 수 있습니다.
-- **차단한 동작?** ARM/DISARM, Uno LASER/TEST/STOP/DEMO, GPIO/레지스터, 리셋/재부팅/펌웨어 변경, Window TH 변경. LLM의 자연어는 시리얼로 전송하지 않습니다.
-
-## 남은 제약
-
-1. Windows 실제 COM/케이블/장시간 스트레스, 실제 4보드/DMA 우수성 실험, 실제 Ollama 모델 추론은 미검증입니다.
-2. native browser 자동화 도구가 없어 브라우저 스크린샷/픽셀 확인은 수행하지 않았습니다. Streamlit AppTest로 모든 탭의 실제 생성과 synthetic 전체 데이터 렌더를 확인했습니다.
-3. 현재 펌웨어 STATUS만으로 숨겨진 전제 조건을 완벽히 확인할 수 없어 물리 유휴 확인과 MCU 거부를 사용합니다. FAULT 중 CAL은 PC에서 보수적으로 차단합니다.
-4. request ID가 없는 ACK 프로토콜은 외부 수동 명령과 완벽히 구별하지 못합니다. 동시에 다른 터미널/물리 제어에서 명령을 실행하지 않는 실험 절차가 필요합니다.
-5. `verified`는 요청 상태의 후속 확인이며 근본 장애의 자동 해결 판정이 아닙니다. 실패/불명확은 자동 재시도하지 않습니다.
-6. 포트 역할은 USB 정보만으로 확정할 수 없어 사용자 매핑입니다. Uno의 ARMED/DISARMED/센서 세부 상태는 출력되지 않아 추정하지 않습니다.
-7. Streamlit 한 프로세스의 여러 브라우저는 수집기·입력 모드·승인 상태를 공유합니다. 승인자는 별도 로그인으로 식별하지 않고 명시적 승인/시각/근거를 기록합니다. 기본 실행은 loopback이며 다중 운영자 권한 시스템은 범위 밖입니다.
-8. 재생은 원본 PC 시각을 보존하고 화면 최신성에는 현재 ingestion 시간을 사용합니다. 긴 파일은 업로드·스케줄링을 위해 메모리에 읽습니다. 재생 간격이 60초보다 크면 대기 60초로 제한하며 시간 그래프는 원래 PC/MCU 시간을 유지합니다.
+- 실제 Windows COM·실제 보드·수시간 4포트·실제 DMA 우수성은 미검증입니다. 단기 Linux PTY·fake multi-port·합성 stress 결과를 실제 UART 성능으로 일반화하지 않습니다.
+- PC 수신 시각은 현장 발생 시각과 다릅니다. 오래된 사건/정상 상태를 현재 상태로 추정하지 않습니다.
+- firmware STATUS의 숨겨진 전제 조건(실험/PB0/pending/HB age 전체)은 여전히 확인 한계가 있습니다. CAL의 환경 확인과 MCU reject가 필요합니다.
+- UI 메모리는 제한하지만 SQLite는 전체 원본을 계속 저장합니다. 디스크 백업/운영은 사용자 책임이며 자동 삭제는 하지 않습니다.
+- Replay는 업로드 파일을 메모리에 파싱하므로 아주 큰 파일은 여러 파일로 나눠 재생하는 것이 좋습니다. 원본 전체 내보내기는 CLI 스트리밍을 사용합니다.
+- 경보를 직접 신고하지 않습니다. 사용자 진술 저장은 실제 경찰 신고의 접수 확인이 아닙니다. 전화 앱 링크는 실제 모드에서 사용자 선택 후에만 노출합니다.

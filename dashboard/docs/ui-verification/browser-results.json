@@ -1,0 +1,23 @@
+{
+  "browser": "159.0.8154.6",
+  "errors": [],
+  "widths": {
+    "1440": {
+      "width": 1440,
+      "document": 1440
+    },
+    "768": {
+      "width": 768,
+      "document": 768
+    },
+    "390": {
+      "width": 390,
+      "document": 390
+    }
+  },
+  "real_download": "raw_live.jsonl",
+  "clipboard": "112 verified",
+  "auto_police_requests": [],
+  "result": "passed",
+  "notes": "No telephone link clicked; no manual report submitted."
+}

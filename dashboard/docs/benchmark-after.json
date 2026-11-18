@@ -1,0 +1,27 @@
+{
+  "root": "/home/songsong/Emb-2/project2_comm_test",
+  "runs_per_mode": 3,
+  "metric_rows": 7200,
+  "db_records": 10229,
+  "render": {
+    "보안 관제": {
+      "median_render_ms": 533.7753969943151,
+      "min_ms": 238.70220803655684,
+      "max_ms": 622.6238609524444,
+      "charts": 0
+    },
+    "DMA 성능 분석": {
+      "median_render_ms": 594.7811820078641,
+      "min_ms": 579.8988880123943,
+      "max_ms": 824.8956960160285,
+      "charts": 4
+    }
+  },
+  "raw_query_calls": 0,
+  "raw_rows_decoded_for_ui": 0,
+  "peak_rss_mib": 216.93359375,
+  "threads": [
+    "MainThread",
+    "log-processing"
+  ]
+}

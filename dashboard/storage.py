@@ -36,6 +36,27 @@ class Storage:
         with self.lock:
             return [json.loads(r[0]) for r in self.db.execute("SELECT payload FROM records ORDER BY rowid DESC LIMIT ?", (limit,))][::-1]
 
+    def artifact(self, artifact_id):
+        with self.lock:
+            row = self.db.execute("SELECT payload FROM artifacts WHERE id=?", (artifact_id,)).fetchone()
+            return json.loads(row[0]) if row else None
+
+    def experiment_index(self, limit=30):
+        fields = ('id', 'source', 'started_at', 'ended_at', 'port', 'session', 'mode', 'load', 'excluded')
+        expressions = ','.join("json_extract(payload, '$." + k + "')" for k in fields)
+        with self.lock:
+            rows = self.db.execute("SELECT " + expressions + ",json_array_length(payload, '$.rows') FROM artifacts WHERE category='experiment' ORDER BY rowid DESC LIMIT ?", (limit,))
+            return [dict(zip(fields + ('interval_count',), row)) for row in rows]
+
+    def raw_jsonl(self, sources, limit=2000):
+        """Explicit export only, with bounded memory and an exact provenance filter."""
+        if not sources:
+            return ''
+        placeholders = ','.join('?' for _ in sources)
+        with self.lock:
+            rows = self.db.execute('SELECT payload FROM records WHERE source IN (' + placeholders + ') ORDER BY rowid DESC LIMIT ?', (*sources, min(10000, max(1, limit))))
+            return '\n'.join(row[0] for row in list(rows)[::-1])
+
     def close(self):
         with self.lock:
             self.db.close()

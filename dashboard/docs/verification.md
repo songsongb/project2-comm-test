@@ -1,68 +1,88 @@
-# 검증 기록
+# UI Lite 검증 기록
 
-실행일: 2026-11-17 (Asia/Seoul). Linux/WSL, Python 3.10.12. 작업 브랜치 `feature/dashboard-llm`, 기존 HEAD `021eed5`. 기존 tracked 파일은 `git diff --exit-code`로 변경 없음 확인. 원본 펌웨어는 [분석 문서의 SHA-256](firmware_analysis.md)으로 보존 기준을 기록했습니다.
+실행일 2026-11-18 (Asia/Seoul). Linux/WSL Ubuntu, Python 3.10.12. 기준 `5de4508` / `feature/dashboard-llm`, 작업 브랜치 `feature/dashboard-ui-lite`입니다. 실제 보드는 연결하지 않았고 사용자 DB 대신 임시 디렉터리의 DB를 사용했습니다.
 
-## 실제 실행 결과
+## 자동 테스트
 
 ```text
 .venv/bin/python -m pytest -c dashboard/pytest.ini dashboard/tests -q
-73 passed
+70 passed
 
 make test
 PASS C vectors + 1,000,000-byte parser fuzz + 100,000 state events (ASan/UBSan)
 Ran 23 tests
 OK
 
-.venv/bin/python -m compileall -q dashboard
-exit 0
-
 .venv/bin/python -m pip check
 No broken requirements found.
 ```
 
-정확한 pytest 실행 시간과 개별 testcase는 [stdout](pytest-results.txt), [JUnit XML](pytest-results.xml)에 저장합니다. 기존 Makefile의 LeakSanitizer 비활성화 조건은 그대로 유지했고 기존 sanitizer/C/Smoke Test 코드는 변경하지 않았습니다.
+정확한 pytest 시간과 testcase는 [stdout](pytest-results.txt), [JUnit XML](pytest-results.xml)에 있습니다. 기존 Smoke Test/C sanitizer 출력은 [legacy-test-results.txt](legacy-test-results.txt)입니다. LLM 전용 테스트는 삭제하고 규칙 탐지 테스트를 새 모듈로 이동했습니다. 단순히 기존 73개에 새 테스트를 더한 숫자가 아닙니다.
 
-Streamlit 서버를 loopback 127.0.0.1:8501로 실제 실행했고 `/_stcore/health`가 **HTTP/1.1 200 OK**, body `ok`를 반환했습니다. 서버 소켓/HTTP 접근은 샌드박스 제한으로 승인된 외부 실행에서 확인했습니다. 테스트용 서버는 검증 후 종료합니다. HTTP health만으로 브라우저 UI를 검증했다고 주장하지 않습니다. 별도로 AppTest가 미연결 상태, Demo 모드 변경/시작, 전체 합성 로그의 5개 탭/그래프/표 생성과 단일 Runtime 재사용을 확인합니다.
-
-주요 설치 버전: Streamlit 1.65.0, Plotly 6.9.0, Pandas 2.3.3, PySerial 3.5, Pytest 9.2.0. Windows에서는 requirements 범위 내 해당 플랫폼의 패키지가 설치되며 실제 Windows 실행은 아래처럼 미검증입니다.
-
-## 필수 16개 항목 대응
-
-| 요구 | 실제 자동 검증 |
+| 요구사항 | 검증 근거 |
 |---|---|
-| 1 STAT 정상 파싱 | 정확한 tag+17 숫자, 필드·자료형 |
-| 2 필드 수/자료형 거부 | 부족/초과/비정수/범위/음수/uint32 초과 파라미터 테스트 |
-| 3 세 mode 식별 | 0/1/2 → Polling/Interrupt/DMA |
-| 4 처리량·누락률 | 1200ms 구간 정확 계산, counter 재차분 안 함, 분모 0 Unknown, 가중 요약·LOAD 분리 |
-| 5 PLOT | 장치별 파싱, 상태 갱신, 화면 그래프 생성 |
-| 6 TRACE | explicit GAP null, PC 수신 누락 null, END 개수 검증, ABORT, 전체 2001슬롯 시나리오 |
-| 7 Hub 이벤트 | ALARM/STATE/FLAGS/CMD 결과, STAT alias와 성능 STAT 분리 |
-| 8 센서 flags | READY/ACTIVE/SENSOR_FAULT 및 unknown bits |
-| 9 섞인 포트 | Window/Hub 식별 보존 및 동시 fake Window/Door 수신 |
-| 10 재부팅 | timestamp 역행, uint32 wrap, BOOT, 지연 TRIAL 구별, ACK 뒤 reboot 확인 불가 |
-| 11 Ollama 실패 | 접속 거부/Timeout stub 중 STAT 수집·처리 지속, unavailable 기록 |
-| 12 미허용 LLM 명령 | ARM/DISARM/LASER/MODE 9/RESET/newline injection 거부, 가짜 evidence/수치/로그 거부 |
-| 13 무승인 조작 | 승인 누락, CAL 기준 확인 누락, 20초 승인 만료 거부 |
-| 14 결과 처리 | CMD_ACK/REJECT/TIMEOUT, wrong node/type/value 무시, CAL 양 ACK, 후속 STATUS+센서 필수 |
-| 15 오래되거나 없는 상태 | stale/missing STATUS, 큐 대기 중 stale, 상태 변경·원복, 재연결, 외부 pending 차단 |
-| 16 Replay 일관성 | 같은 원본의 동일 parsed fields, 원본 PC 시각 유지, source 분리, 6조건 전체 합성 재생 |
+| 1~2 PyArrow 혼합 node | 정수/문자/누락/중첩 필드에 명시적 dtype 적용 후 `pyarrow.Table.from_pandas()` 직접 성공; UI에서도 양 타입 함께 렌더 |
+| 3~4 두 화면 | AppTest와 Chromium에서 Security / DMA Lab 정상 생성, 기본 탭 0개, 보안 그래프 0개·Lab 그래프 4개 |
+| 5~6 Runtime·COM 유지 | 같은 Runtime/State/SerialManager/port worker 객체 및 포트 factory 생성 횟수 1회 확인 |
+| 7 불필요 그래프 방지 | 선택하지 않은 모드와 닫힌 센서 패널의 Plotly 0회; 같은 revision 캐시 재사용·상한 |
+| 8 Demo | 전체 합성 파일 처리, 6조건 및 보안 ALARM/LINK_LOST/FAULT, 실제 브라우저 재생 |
+| 9 Replay | JSONL 원본 필드/PC 시각 보존, replay-synthetic provenance와 비동기 큐 처리 |
+| 10 시리얼 경로 | 기존 실제 PySerial↔Linux PTY 왕복, fake 다중 포트·부분 줄·끊김/재연결·다른 포트 지속, OS 중복 락 |
+| 11 DMA 계산 보존 | metrics.py 바이트 불변, 기존 처리량·가중 평균·전환 제외·LOAD 분리 테스트 유지 |
+| 12 6조건 표 | 6행 항상 표시, 0%와 No data 구별, source/port/session 범위 분리 |
+| 13 TRACE | gap/null·PC 수신 누락·END 개수·ABORT 기존 테스트, 브라우저 상세 패널 |
+| 14 TRIAL | valid=1만 분모, invalid 분리, 모드/LOAD/폭별 표 렌더 |
+| 15 SQLite 보존 | 기존 diagnosis artifact와 live/demo 원본을 넣은 DB 재열기 후 내용 보존·출처 필터 |
+| 16 원본 다운로드 | 일반 갱신의 DB raw 조회 없음, 준비 버튼 이후 실제 Chromium download, CLI 전량 export·덮어쓰기 거부 |
+| 17 LLM 제거 | 세 모듈의 파일/수입 부재, 새 Runtime에 diagnosis/auto_diagnose 없음·추론 스레드 없음 |
+| 18 수동 제어 | 무승인/중복/만료/오래된 상태 거부, ACK/REJECT/TIMEOUT, CAL 양 ACK/양 센서, ACK 후 재부팅 결과 unknown |
+| 19 Demo/Replay 차단 | UI disabled 및 Controller의 source_mode 검사. 가짜 Hub 연결을 넣어도 STATUS/MODE 거부 |
+| 20 자동 신고 없음 | emergency 모듈에 외부 통신 경로 없음, 명시 확인 없는 수동 기록 거부, Demo practice_record·접수 미확인, 브라우저 전화 링크 클릭/신고 없음 |
 
-추가 검증: 실제 PySerial↔Linux PTY 로그 수신/명령 왕복, 포트별 자동 재연결·다른 포트 지속 수신, 다른 프로세스의 중복 포트 락 거부, 단일 승인 중복 사용 거부, 다른 제안의 중복 실행 거부, 부분 write 결과 unknown, ACK만으로 verified 금지, JSONL 전체 SQLite export 및 덮어쓰기 차단, 저장 실험의 경계/조건 변경 제외, 규칙 쿨다운, 정상 STAT의 자동 LLM 미호출, 중복 진단 방지.
+## 실제 Chromium 검증
 
-PTY는 실제 UART 하드웨어가 아닙니다. Ollama 성공 응답은 HTTP client mock을 통한 schema·payload·timeout 경로 검증이며 실제 모델의 한국어 추론 품질 검증이 아닙니다.
+선택적 개발용 Playwright/Chromium으로 loopback 테스트 서버를 열었습니다. 앱 실행 의존성에는 Playwright를 추가하지 않았습니다. 시스템 공유 라이브러리와 한글 폰트가 없는 환경이어서 필요한 파일을 `/tmp`에 준비했고 시스템 패키지나 Ollama는 변경하지 않았습니다.
 
-## 미검증 / 남은 실행 절차
+검증 스크립트: [browser_check.py](../scripts/browser_check.py). 결과: [browser-results.json](ui-verification/browser-results.json).
 
-| 항목 | 상태 / 이유 |
-|---|---|
-| Windows 실제 설치·COM 열기·msvcrt 락 | **미검증** — 현재 실행 OS는 Linux/WSL. 이식 가능한 경로/Windows 락 분기를 구현했지만 실제 Windows가 필요 |
-| 실제 4보드·부분 하드웨어 연결·케이블 분리 | **미검증** — 실제 장치 없이 fake serial와 Linux PTY로 검증 |
-| DMA 실제 성능과 공정한 6조건 실험 | **미검증** — 제공 실측 로그 없음. 합성값을 실측으로 사용하지 않음 |
-| 실제 센서/경보/TRACE/TRIAL | **미검증** — 실제 로그 형식은 코드로 확인했고 수신 경로는 합성 자료로 검증 |
-| 실제 MODE/LOAD/CAL UART 실행 | **미검증** — PC 승인/전송/결과 경로는 mock 및 PTY, MCU 수락과 물리 변화는 실장치 필요 |
-| 실제 Ollama 서버/모델 추론·GPU/CPU 지연 | **미검증** — 모델 설치/실서버 호출 없이 mock 성공/실패/timeout을 검증 |
-| 브라우저 시각 QA/스크린샷 | **미검증** — 브라우저 자동화 도구 없음. Streamlit AppTest 실행·HTTP health는 검증 |
-| 수시간 이상 4포트 연속 스트레스 | **미검증** — bounded buffer/독립 reader/SQLite WAL 구조 및 단기 테스트만 수행 |
-| 펌웨어 rebuild/업로드 | **미수행** — 원본 보존 요구에 따라 PC 구현만 추가 |
+- 미연결 상태 Unknown, 두 화면 전환, 4개 비교 그래프와 6조건 표, 센서 상세 LDR/TRACE/TRIAL 표시를 확인했습니다.
+- 실제 expander 열기, 준비 버튼으로만 raw DB 읽기, `raw_live.jsonl` 다운로드를 확인했습니다.
+- Demo 재생은 송신 스케줄뿐 아니라 수집 큐가 0행이 된 뒤 확인합니다. 경보 요약에서 ALARM_BEAM을 확인합니다.
+- 112 복사 버튼의 실제 브라우저 클립보드 값을 확인합니다. tel 링크는 클릭하지 않고 신고 수동 기록도 제출하지 않습니다. Demo에서는 전화 링크가 없습니다.
+- 1440 / 768 / 390px에서 document scrollWidth가 viewport를 초과하지 않았습니다. 그래프는 좁은 화면에서 세로 배치되고 큰 표는 자체 스크롤을 사용합니다.
+- 브라우저 pageerror는 0개입니다. 한글 폰트를 준비한 후 캡처에서 글자 깨짐·문서 가로 넘침·시각적 겹침을 확인했습니다.
+- 자동 갱신은 일부 fragment에만 적용되고 정적 메뉴·입력·접힌 패널은 갱신 대상에서 빠집니다. 짧은 실행에서 심각한 깜빡임은 관찰되지 않았으나 별도의 영상·정량 프레임 분석은 수행하지 않았습니다.
 
-실장치 검증은 [README의 6조건 절차](../README.md)를 따라 raw JSONL/SQLite와 각 실험 CSV를 저장한 뒤 진행합니다. 실제 경보가 발생했을 때 자동 경보 해제·레이저 작동을 하지 않는지, MCU reject가 실패로 남는지, 장치/상태가 끊기면 명령이 거부되는지를 함께 확인하세요.
+캡처: [미연결 관제](ui-verification/security-disconnected.png), [보안 Demo](ui-verification/security-demo.png), [신고 준비](ui-verification/emergency-demo.png), [DMA Demo](ui-verification/dma-demo.png), [센서 상세](ui-verification/sensor-details.png), [모바일](ui-verification/dma-mobile.png). 캡처는 합성/미연결 상태이며 실제 하드웨어 화면이 아닙니다.
+
+## 기존 구조와 비교 측정
+
+동일한 현재 합성 JSONL과 추가 합성 STAT를 넣어 **7200구간 버퍼 / SQLite 10,229행** 상태를 만들었습니다. 같은 Python/패키지 환경에서 분리 프로세스로 AppTest 전체 재실행을 각 모드 3회 측정했습니다. 닫힌 패널은 기본 상태입니다. 벤치마크는 네트워크나 모델을 호출하지 않습니다. 기존 코드에는 idle 진단 스레드가 존재하며 새 코드에는 없습니다.
+
+| 측정 | 기존 5탭 | 새 보안 관제 | 새 DMA Lab |
+|---|---:|---:|---:|
+| 렌더 중앙값 (ms) | 1266.26 | 533.78 | 594.78 |
+| 범위 (ms) | 1222.27~1403.00 | 238.70~622.62 | 579.90~824.90 |
+| 기본 생성 그래프 수 | 7 | 0 | 4 |
+| 일반 갱신 원본 DB 조회 | 회당 10,000행 | 0행 | 0행 |
+| 프로세스 최고 RSS (MiB) | 268.37 | 새 두 모드 통합 216.93 | 같은 프로세스 |
+
+원자료: [before](benchmark-before.json), [after](benchmark-after.json). 재현 도구: [benchmark_ui.py](../scripts/benchmark_ui.py). 측정은 UI 생성/직렬화를 포함한 AppTest 경과 시간이며 실제 브라우저 paint FPS·MCU 처리 속도·전체 WSL RAM을 의미하지 않습니다. 3회뿐인 짧은 합성 비교이므로 모든 PC에서 같은 개선 폭을 보장하지 않습니다. RSS는 OS의 프로세스 최고값이며 현재 사용량과 다릅니다. 기존 버전에서는 혼합 node의 Arrow 자동 복구 경고도 재현됐습니다.
+
+## 메모리 가속 시험
+
+[soak_runtime.py](../scripts/soak_runtime.py)로 합성 STAT **40,000행**을 약 **129.19초**에 연속 처리했습니다. 실시간 11시간 운영을 대체하는 시험이 아니며 수신 UART를 사용하지 않았습니다.
+
+| 처리량 시점 | Python 현재 힙 (MiB) | STAT 버퍼 | 원본 메모리 버퍼 |
+|---|---:|---:|---:|
+| 20,000행 | 14.34196 | 7200 | 2000 |
+| 40,000행 | 14.33787 | 7200 | 2000 |
+
+SQLite에는 40,000행 모두 저장됐습니다. 해당 프로세스 최고 RSS는 52.49MiB였으며 이는 Streamlit/Plotly/브라우저를 포함하지 않은 Runtime 시험입니다. 원자료: [soak-results.json](soak-results.json). 버퍼가 포화된 뒤 두 관측점 사이에서 Python 힙이 계속 증가하는 현상은 확인되지 않았습니다. 수시간 실제 장치 시험까지 무누수라고 단정하지 않습니다.
+
+## 보존 및 미검증
+
+- SHA-256 보존 대상: 사용자 펌웨어 6개, metrics.py, protocol_parser.py, serial_manager.py, 기존 dashboard/data/dashboard.sqlite3. 이번 앱 테스트/브라우저/벤치마크는 임시 DB만 사용했습니다. DB 자동 삭제나 diagnosis migration은 없습니다.
+- **미검증:** Windows 실제 COM/배포, 4보드 물리 연결과 케이블 문제, 실제 센서·경보·MODE/LOAD/CAL 결과, 실제 DMA 공정한 6조건 우수성 실험, 수시간 4포트 연속 운영, 실제 전화 앱·경찰 신고 접수. 마지막 항목은 구현 범위 밖입니다.
+- 모든 성능 예시는 합성 자료입니다. UART ORE/DMA overrun·실제 부저/RGB/릴레이 피드백·검출 지연·전체 CPU 사용률은 Not measured입니다.
+- Streamlit 여러 브라우저는 같은 Runtime과 제어 상태를 공유합니다. UI 모드 전환과 입력 소스 변경의 의미를 구분해 사용하세요.

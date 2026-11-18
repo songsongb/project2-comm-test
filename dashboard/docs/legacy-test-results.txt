@@ -1,0 +1,31 @@
+ASAN_OPTIONS=detect_leaks=0 ./build/core_test
+PASS C vectors + 1,000,000-byte parser fuzz + 100,000 state events (ASan/UBSan)
+python3 -m unittest discover -s tests -v
+test_T10_gpio_codes_host_mapping_only (test_comm.CommunicationTests) ... ok
+test_T1_two_independent_heartbeat_streams (test_comm.CommunicationTests) ... ok
+test_T2_beam_alarm_latched_until_disarm (test_comm.CommunicationTests) ... ok
+test_T3_door_deadline_not_extended_by_repeat_or_arm (test_comm.CommunicationTests) ... ok
+test_T4_shock_five_second_return (test_comm.CommunicationTests) ... ok
+test_T5_combo_both_orders_at_500ms_and_timestamp_zero (test_comm.CommunicationTests) ... ok
+test_T6_T7_timeout_exact_boundary_and_recovery (test_comm.CommunicationTests) ... ok
+test_T8_bad_xor_does_not_refresh_heartbeat_and_recovers (test_comm.CommunicationTests) ... ok
+test_T9_dma_bursts_wraps_two_ports_random_chunks (test_comm.CommunicationTests) ... ok
+test_combo_501ms_disarmed_and_rearm_history (test_comm.CommunicationTests) ... ok
+test_corrupt_length_then_concatenated_recovery (test_comm.CommunicationTests) ... ok
+test_dma_full_lap_overrun_recovery_and_u32_wrap (test_comm.CommunicationTests) ... ok
+test_door_close_cancels_and_open_when_disarmed (test_comm.CommunicationTests) ... ok
+test_encoder_known_vectors (test_comm.CommunicationTests) ... ok
+test_invalid_door_boolean_on_correct_port (test_comm.CommunicationTests) ... ok
+test_invalid_schema_and_wrong_port (test_comm.CommunicationTests) ... ok
+test_partial_frames_all_split_positions_and_embedded_sof (test_comm.CommunicationTests) ... ok
+test_shock_expiry_does_not_cancel_open_door (test_comm.CommunicationTests) ... ok
+test_startup_grace_and_alarm_fault_priority (test_comm.CommunicationTests) ... ok
+test_u32_time_wrap_and_sequence_wrap (test_comm.CommunicationTests) ... ok
+test_command_validation (test_monitor.MonitorTests) ... ok
+test_offline_replay (test_monitor.MonitorTests) ... ok
+test_pyserial_pseudoterminal_fragmented_logs_and_command (test_monitor.MonitorTests) ... ok
+
+----------------------------------------------------------------------
+Ran 23 tests in 1.258s
+
+OK
